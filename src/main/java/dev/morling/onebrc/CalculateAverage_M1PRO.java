@@ -38,6 +38,12 @@ import sun.misc.Unsafe;
  * 1BRC solution tuned for Apple Silicon (M1 Pro) instead of the reference
  * EPYC 7502P (Zen2) evaluation box used by the official leaderboard.
  *
+ * v8: replaces the variable-length SWAR name-scanning loop with
+ * CalculateAverage_thomaswue's fixed 16-byte-window technique - see the
+ * comment on processRow() for the full rationale and for why a v7 attempt to
+ * interleave the *old* loop-based scan 3-way made things worse rather than
+ * better (the loop itself, not the lack of interleaving, was the problem).
+ *
  * v5: OffHeapTable slots now also carry the name's first 16 bytes packed
  * into two longs, compared directly instead of always calling
  * regionEquals() - see the comment on OffHeapTable.update() for why (JFR
@@ -143,7 +149,6 @@ public class CalculateAverage_M1PRO {
     private static final long BROADCAST_80 = 0x8080808080808080L;
     private static final long SEMI_PATTERN = 0x3B3B3B3B3B3B3B3BL; // ';' repeated 8x
     private static final long NEWLINE_PATTERN = 0x0A0A0A0A0A0A0A0AL; // '\n' repeated 8x
-    private static final long FIBONACCI_MULT = 0x9E3779B97F4A7C15L;
 
     private static final int SLOT_SIZE = 64; // bytes; one 64B cache line per slot
     // Slot layout (offsets in bytes):
@@ -166,6 +171,14 @@ public class CalculateAverage_M1PRO {
     // CalculateAverage_thomaswue, which uses the identical trick).
     private static final long[] MASK1 = { 0xFFL, 0xFFFFL, 0xFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFFFL, 0xFFFFFFFFFFFFL,
             0xFFFFFFFFFFFFFFL, 0xFFFFFFFFFFFFFFFFL };
+
+    // v8: used only to determine nameLen via the fixed 16-byte-window fast path in
+    // processRow (see there) - 0 when the delimiter was found within the first 8
+    // bytes (word1's own letterCount1 already covers the whole name), all-ones when
+    // it wasn't (so word2's letterCount2 also needs to count toward nameLen).
+    // Index 8 means "not found in word1 at all". Exact technique and array from
+    // this repo's CalculateAverage_thomaswue.
+    private static final long[] FAST_MASK2 = { 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0xFFFFFFFFFFFFFFFFL };
 
     // Matches this machine's real P-core count (8, via `sysctl
     // hw.perflevel0.physicalcpu`). An earlier version of this file
@@ -395,6 +408,11 @@ public class CalculateAverage_M1PRO {
         return new SegmentOutput(buffer, table.extractRawAndFree());
     }
 
+    private static long findDelimiter(long word) {
+        long input = word ^ SEMI_PATTERN;
+        return (input - BROADCAST_01) & ~input & BROADCAST_80;
+    }
+
     /**
      * Parses one "name;value\n" row starting at {@code i} into {@code table}
      * and returns the position just past it. {@code limit} is always the
@@ -402,38 +420,92 @@ public class CalculateAverage_M1PRO {
      * each segment is its own separate MappedByteBuffer here (unlike
      * CalculateAverage_thomaswue's single whole-file mapping), so this is
      * the only bound that must never be read past.
+     *
+     * v8: reads the first 16 bytes unconditionally and locates the ';' via a
+     * single trailing-zero-count on a combined delimiter mask, instead of
+     * looping 8 bytes at a time - credit: CalculateAverage_thomaswue. A v7
+     * attempt to interleave the old loop-based scan 3-way across cursors
+     * made things measurably worse (more CPU-seconds, not fewer): unrolling
+     * a *loop* with an unpredictable trip count 3x creates three independent
+     * loop-back branches for the scheduler to juggle, unlike thomaswue's
+     * fixed, loop-free 16-byte window, which is what actually made his
+     * interleaving cheap. This replaces the loop for the common case (name
+     * <=16 bytes); the loop remains only as a fallback for the rare longer
+     * names, or when too close to the segment's own end to safely read 16
+     * bytes unconditionally. Unlike thomaswue's own fast path, the masked
+     * word used for hashing/comparison is computed the same way (via
+     * finishRow, below) regardless of which path determined nameLen - the
+     * fast path only determines nameLen faster here, it doesn't reuse
+     * thomaswue's exact (delimiter-inclusive) word masking, so there's no
+     * risk of the same station producing inconsistent hash/comparison words
+     * depending on which path a given occurrence happens to take.
      */
     private static int processRow(long base, int limit, int i, OffHeapTable table) {
         int nameStart = i;
-        int hash = 0;
 
-        // SWAR fast path: fold 8 bytes at a time into the running hash
-        // as long as none of them is ';' (hasZero bit trick on the XOR
-        // against a broadcast ';' pattern). No byte-by-byte copy needed
-        // since the key is stored as a zero-copy (offset,len) pair.
-        while (i + 8 <= limit) {
+        if (i + 16 <= limit) {
             long word = UNSAFE.getLong(base + i);
+            long word2 = UNSAFE.getLong(base + i + 8);
+            long delimiterMask = findDelimiter(word);
+            long delimiterMask2 = findDelimiter(word2);
+            if ((delimiterMask | delimiterMask2) != 0) {
+                int letterCount1 = Long.numberOfTrailingZeros(delimiterMask) >>> 3;
+                int letterCount2 = Long.numberOfTrailingZeros(delimiterMask2) >>> 3;
+                long sel = FAST_MASK2[letterCount1];
+                int nameLen = (int) (letterCount1 + (letterCount2 & sel));
+                int afterDelimiter = nameStart + nameLen + 1;
+                return finishRow(base, limit, nameStart, nameLen, afterDelimiter, word, word2, table);
+            }
+        }
+
+        // Slow path: delimiter beyond the 16-byte window, or too close to
+        // the segment's own end to safely read 16 bytes unconditionally.
+        int j = nameStart;
+        while (j + 8 <= limit) {
+            long word = UNSAFE.getLong(base + j);
             long xored = word ^ SEMI_PATTERN;
             long hasZero = (xored - BROADCAST_01) & ~xored & BROADCAST_80;
             if (hasZero != 0) {
-                break; // a ';' is somewhere in this word - finish scalar below
+                break;
             }
-            long mixed = word * FIBONACCI_MULT;
-            hash = hash * 31 + (int) (mixed ^ (mixed >>> 32));
-            i += 8;
+            j += 8;
         }
-
         byte b;
-        while ((b = UNSAFE.getByte(base + i)) != ';') {
-            hash = hash * 31 + b;
-            i++;
+        while ((b = UNSAFE.getByte(base + j)) != ';') {
+            j++;
         }
-        int nameLen = i - nameStart;
-        i++; // skip ';'
-        int finalHash = finishName(hash);
+        int nameLen = j - nameStart;
+        long word = UNSAFE.getLong(base + nameStart);
+        long word2 = UNSAFE.getLong(base + nameStart + 8);
+        return finishRow(base, limit, nameStart, nameLen, j + 1, word, word2, table);
+    }
+
+    /**
+     * Shared tail for both processRow() paths: masks word/word2 down to the
+     * name's true length (same convention regardless of which path found
+     * nameLen), derives a hash from the masked words, parses the number, and
+     * updates the table. {@code i} is the position right after the ';'.
+     */
+    private static int finishRow(long base, int limit, int nameStart, int nameLen, int i, long word, long word2, OffHeapTable table) {
+        long firstWord;
+        long secondWord;
+        if (nameLen <= 8) {
+            firstWord = word & MASK1[nameLen - 1];
+            secondWord = 0;
+        }
+        else if (nameLen < 16) {
+            firstWord = word;
+            secondWord = word2 & MASK1[nameLen - 9];
+        }
+        else {
+            firstWord = word;
+            secondWord = word2;
+        }
+        long combined = firstWord ^ secondWord;
+        int hash = finishName((int) combined ^ (int) (combined >>> 32));
 
         boolean neg = false;
-        b = UNSAFE.getByte(base + i);
+        byte b = UNSAFE.getByte(base + i);
         if (b == '-') {
             neg = true;
             i++;
@@ -455,7 +527,7 @@ public class CalculateAverage_M1PRO {
         if (neg)
             value = -value;
 
-        table.update(nameStart, nameLen, finalHash, value);
+        table.update(nameStart, nameLen, hash, firstWord, secondWord, value);
         return i;
     }
 
@@ -563,43 +635,19 @@ public class CalculateAverage_M1PRO {
             return tableBase + (long) idx * SLOT_SIZE;
         }
 
-        void update(int nameOffset, int nameLen, int hash, int value) {
-            // v6: pack every name's first 16 bytes into two longs, unconditionally
-            // (not just for names <=16 bytes as in v5), using the exact same masking
-            // as before but with no truncation once nameLen reaches 16. This makes
-            // (storedFirst, storedSecond) == (0, 0) a universal empty-slot sentinel,
-            // for *every* slot regardless of name length - no real station name can
-            // produce (0,0) here since its first byte is always non-zero printable
-            // text, so we can drop the separate storedLen read+compare that v5 still
-            // needed just to detect occupancy. storedLen is still written on insert
-            // (extractRawAndFree() and resize() still use it) and still read on the
-            // >16-byte fallback path, just no longer on this hot occupied/empty
-            // check. Names longer than 16 bytes still need regionEquals() to confirm
-            // full equality beyond that first-16-byte prefix - credit: this repo's
-            // CalculateAverage_thomaswue, which uses the identical (0,0)-as-empty /
-            // packed-word-first structure.
-            //
-            // (A follow-up attempt at also packing count/min/max into one long field
-            // was tried and reverted: JFR profiling and CPU-seconds both showed no
-            // measurable improvement, most likely because sum/count/min/max were
-            // already co-located in this same 64-byte cache line, so there wasn't
-            // much real memory-latency cost left to remove - the packing arithmetic
-            // roughly cancelled out whatever it saved.)
-            long nameAddr = segmentBase + nameOffset;
-            long firstWord;
-            long secondWord;
-            if (nameLen <= 8) {
-                firstWord = UNSAFE.getLong(nameAddr) & MASK1[nameLen - 1];
-                secondWord = 0;
-            }
-            else if (nameLen < 16) {
-                firstWord = UNSAFE.getLong(nameAddr);
-                secondWord = UNSAFE.getLong(nameAddr + 8) & MASK1[nameLen - 9];
-            }
-            else {
-                firstWord = UNSAFE.getLong(nameAddr);
-                secondWord = UNSAFE.getLong(nameAddr + 8);
-            }
+        // v8: firstWord/secondWord/hash are now computed once by the caller
+        // (processRow/finishRow) and passed in directly, instead of being
+        // recomputed here from nameOffset on every call - the caller already
+        // has word/word2 loaded from its own 16-byte read, so recomputing
+        // them again here would just be a second, redundant read of the same
+        // bytes. (storedFirst, storedSecond) == (0, 0) remains a universal
+        // empty-slot sentinel for every slot regardless of name length - no
+        // real station name can produce (0,0) here since its first byte is
+        // always non-zero printable text. Names longer than 16 bytes still
+        // need regionEquals() to confirm full equality beyond that
+        // first-16-byte prefix - credit: this repo's CalculateAverage_thomaswue,
+        // which uses the identical (0,0)-as-empty / packed-word-first structure.
+        void update(int nameOffset, int nameLen, int hash, long firstWord, long secondWord, int value) {
             boolean needsFullCompare = nameLen > 16;
 
             int idx = hash & mask;
@@ -625,7 +673,7 @@ public class CalculateAverage_M1PRO {
                 }
 
                 if (storedFirst == firstWord && storedSecond == secondWord
-                        && (!needsFullCompare || regionEquals(segmentBase + UNSAFE.getInt(addr + 16), nameAddr, nameLen))) {
+                        && (!needsFullCompare || regionEquals(segmentBase + UNSAFE.getInt(addr + 16), segmentBase + nameOffset, nameLen))) {
                     UNSAFE.putLong(addr, UNSAFE.getLong(addr) + value);
                     UNSAFE.putInt(addr + 8, UNSAFE.getInt(addr + 8) + 1);
                     short min = UNSAFE.getShort(addr + 12);
