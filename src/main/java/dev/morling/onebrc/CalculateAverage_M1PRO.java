@@ -343,6 +343,18 @@ public class CalculateAverage_M1PRO {
     // the plain single-cursor sweep - see processSegment.
     private static final boolean INTERLEAVE = !"false".equals(System.getProperty("M1PRO.interleave"));
 
+    // v12: thomaswue's 3-way interleaving width was tuned for an Intel i9-13900K
+    // (per his file header comment), not for Apple Silicon. M1 Pro's core is wider
+    // (more physical registers, wider decode) than contemporary x86 cores. A paired
+    // A/B (8 rounds, both hand-unrolled with named locals to rule out array-indexing
+    // overhead as a confound - see processSegmentInterleavedN's Javadoc for why that
+    // matters) found width=4 winning 6/8 rounds, ~0.5% faster on average - small but
+    // consistent, so it's the default here. Overridable via -DM1PRO.interleaveWidth=N;
+    // 3 and 4 both route to their own hand-unrolled path (see processSegment /
+    // processSegmentInterleaved4), other values go through the general array-based
+    // path, which is *not* a clean comparison against either hand-unrolled path.
+    private static final int INTERLEAVE_WIDTH = Integer.getInteger("M1PRO.interleaveWidth", 4);
+
     private static SegmentOutput processSegment(FileChannel channel, long start, long end) throws Exception {
         MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, start, end - start);
         long base = addressOf(buffer);
@@ -367,6 +379,14 @@ public class CalculateAverage_M1PRO {
                 i = processRow(base, limit, i, table);
             }
             return new SegmentOutput(buffer, table.extractRawAndFree());
+        }
+
+        if (INTERLEAVE_WIDTH == 4) {
+            return processSegmentInterleaved4(base, limit, table, buffer);
+        }
+
+        if (INTERLEAVE_WIDTH != 3) {
+            return processSegmentInterleavedN(base, limit, table, buffer);
         }
 
         // v4: split the segment into three roughly equal, row-aligned parts
@@ -406,6 +426,89 @@ public class CalculateAverage_M1PRO {
         }
 
         return new SegmentOutput(buffer, table.extractRawAndFree());
+    }
+
+    /**
+     * v12: hand-unrolled 4-way interleaving, named locals (pos1..pos4), matching
+     * the exact style of the 3-way block above - added specifically because the
+     * general array-based N-way path below was found to carry its own overhead
+     * (even at width=2, slower than the hand-unrolled 3-way baseline), confounding
+     * any real signal about whether a wider width helps on M1 Pro's core. This
+     * isolates the width variable from that array-indexing/JIT-scheduling overhead.
+     */
+    private static SegmentOutput processSegmentInterleaved4(long base, int limit, OffHeapTable table, MappedByteBuffer buffer) {
+        int dist = limit / 4;
+        int mid1 = nextNewLineBounded(base, dist, limit);
+        int mid2 = nextNewLineBounded(base, dist * 2, limit);
+        int mid3 = nextNewLineBounded(base, dist * 3, limit);
+
+        int pos1 = 0;
+        int end1 = mid1;
+        int pos2 = mid1 + 1;
+        int end2 = mid2;
+        int pos3 = mid2 + 1;
+        int end3 = mid3;
+        int pos4 = mid3 + 1;
+        int end4 = limit;
+
+        while (pos1 < end1 && pos2 < end2 && pos3 < end3 && pos4 < end4) {
+            pos1 = processRow(base, limit, pos1, table);
+            pos2 = processRow(base, limit, pos2, table);
+            pos3 = processRow(base, limit, pos3, table);
+            pos4 = processRow(base, limit, pos4, table);
+        }
+        while (pos1 < end1) {
+            pos1 = processRow(base, limit, pos1, table);
+        }
+        while (pos2 < end2) {
+            pos2 = processRow(base, limit, pos2, table);
+        }
+        while (pos3 < end3) {
+            pos3 = processRow(base, limit, pos3, table);
+        }
+        while (pos4 < end4) {
+            pos4 = processRow(base, limit, pos4, table);
+        }
+
+        return new SegmentOutput(buffer, table.extractRawAndFree());
+    }
+
+    /**
+     * v12: general N-way interleaving, for the -DM1PRO.interleaveWidth=N sweep -
+     * see the field Javadoc. Splits the segment into N roughly equal, row-aligned
+     * parts and round-robins processRow() across all N cursors per outer iteration,
+     * same principle as the hand-unrolled 3-way version above, just array-indexed
+     * to support a runtime-chosen width instead of 3 named locals.
+     */
+    private static SegmentOutput processSegmentInterleavedN(long base, int limit, OffHeapTable table, MappedByteBuffer buffer) {
+        int n = INTERLEAVE_WIDTH;
+        int[] pos = new int[n];
+        int[] segEnd = new int[n];
+        long dist = limit / (long) n;
+        int prevEnd = -1;
+        for (int k = 0; k < n; k++) {
+            pos[k] = prevEnd + 1;
+            segEnd[k] = (k == n - 1) ? limit : nextNewLineBounded(base, (int) (dist * (k + 1)), limit);
+            prevEnd = segEnd[k];
+        }
+
+        while (true) {
+            for (int k = 0; k < n; k++) {
+                if (pos[k] >= segEnd[k]) {
+                    // At least one cursor is out of rows - fall through to the
+                    // per-cursor tail loops below for whichever ones still have work.
+                    for (int t = 0; t < n; t++) {
+                        while (pos[t] < segEnd[t]) {
+                            pos[t] = processRow(base, limit, pos[t], table);
+                        }
+                    }
+                    return new SegmentOutput(buffer, table.extractRawAndFree());
+                }
+            }
+            for (int k = 0; k < n; k++) {
+                pos[k] = processRow(base, limit, pos[k], table);
+            }
+        }
     }
 
     private static long findDelimiter(long word) {
