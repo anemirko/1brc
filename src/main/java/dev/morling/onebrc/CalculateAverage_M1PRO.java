@@ -564,34 +564,51 @@ public class CalculateAverage_M1PRO {
         }
 
         void update(int nameOffset, int nameLen, int hash, int value) {
-            // v5: for names that fit in 16 bytes (the vast majority of real station
-            // names), pack them into two longs up front and compare those directly
-            // against the stored slot - one or two register compares instead of a
-            // regionEquals() call, for the common case of matching an
-            // already-seen station. This was found (via JFR profiling) to be ~12%
-            // of total runtime before this fix, unconditionally calling
-            // regionEquals() even on repeat hits. Longer names still fall back to
-            // regionEquals() for the full comparison - credit: this repo's
-            // CalculateAverage_thomaswue, which uses the same packed-word trick.
-            boolean shortName = nameLen <= 16;
-            long firstWord = 0;
-            long secondWord = 0;
-            if (shortName) {
-                long nameAddr = segmentBase + nameOffset;
-                if (nameLen <= 8) {
-                    firstWord = UNSAFE.getLong(nameAddr) & MASK1[nameLen - 1];
-                }
-                else {
-                    firstWord = UNSAFE.getLong(nameAddr);
-                    secondWord = UNSAFE.getLong(nameAddr + 8) & MASK1[nameLen - 9];
-                }
+            // v6: pack every name's first 16 bytes into two longs, unconditionally
+            // (not just for names <=16 bytes as in v5), using the exact same masking
+            // as before but with no truncation once nameLen reaches 16. This makes
+            // (storedFirst, storedSecond) == (0, 0) a universal empty-slot sentinel,
+            // for *every* slot regardless of name length - no real station name can
+            // produce (0,0) here since its first byte is always non-zero printable
+            // text, so we can drop the separate storedLen read+compare that v5 still
+            // needed just to detect occupancy. storedLen is still written on insert
+            // (extractRawAndFree() and resize() still use it) and still read on the
+            // >16-byte fallback path, just no longer on this hot occupied/empty
+            // check. Names longer than 16 bytes still need regionEquals() to confirm
+            // full equality beyond that first-16-byte prefix - credit: this repo's
+            // CalculateAverage_thomaswue, which uses the identical (0,0)-as-empty /
+            // packed-word-first structure.
+            //
+            // (A follow-up attempt at also packing count/min/max into one long field
+            // was tried and reverted: JFR profiling and CPU-seconds both showed no
+            // measurable improvement, most likely because sum/count/min/max were
+            // already co-located in this same 64-byte cache line, so there wasn't
+            // much real memory-latency cost left to remove - the packing arithmetic
+            // roughly cancelled out whatever it saved.)
+            long nameAddr = segmentBase + nameOffset;
+            long firstWord;
+            long secondWord;
+            if (nameLen <= 8) {
+                firstWord = UNSAFE.getLong(nameAddr) & MASK1[nameLen - 1];
+                secondWord = 0;
             }
+            else if (nameLen < 16) {
+                firstWord = UNSAFE.getLong(nameAddr);
+                secondWord = UNSAFE.getLong(nameAddr + 8) & MASK1[nameLen - 9];
+            }
+            else {
+                firstWord = UNSAFE.getLong(nameAddr);
+                secondWord = UNSAFE.getLong(nameAddr + 8);
+            }
+            boolean needsFullCompare = nameLen > 16;
 
             int idx = hash & mask;
             while (true) {
                 long addr = slotAddr(table, idx);
-                short storedLen = UNSAFE.getShort(addr + 20);
-                if (storedLen == 0) {
+                long storedFirst = UNSAFE.getLong(addr + 32);
+                long storedSecond = UNSAFE.getLong(addr + 40);
+
+                if (storedFirst == 0 && storedSecond == 0) {
                     UNSAFE.putLong(addr, value);
                     UNSAFE.putInt(addr + 8, 1);
                     UNSAFE.putShort(addr + 12, (short) value);
@@ -606,26 +623,18 @@ public class CalculateAverage_M1PRO {
                         resize();
                     return;
                 }
-                if (storedLen == nameLen) {
-                    boolean match;
-                    if (shortName) {
-                        match = UNSAFE.getLong(addr + 32) == firstWord && UNSAFE.getLong(addr + 40) == secondWord;
-                    }
-                    else {
-                        int storedOffset = UNSAFE.getInt(addr + 16);
-                        match = regionEquals(segmentBase + storedOffset, segmentBase + nameOffset, nameLen);
-                    }
-                    if (match) {
-                        UNSAFE.putLong(addr, UNSAFE.getLong(addr) + value);
-                        UNSAFE.putInt(addr + 8, UNSAFE.getInt(addr + 8) + 1);
-                        short min = UNSAFE.getShort(addr + 12);
-                        if (value < min)
-                            UNSAFE.putShort(addr + 12, (short) value);
-                        short max = UNSAFE.getShort(addr + 14);
-                        if (value > max)
-                            UNSAFE.putShort(addr + 14, (short) value);
-                        return;
-                    }
+
+                if (storedFirst == firstWord && storedSecond == secondWord
+                        && (!needsFullCompare || regionEquals(segmentBase + UNSAFE.getInt(addr + 16), nameAddr, nameLen))) {
+                    UNSAFE.putLong(addr, UNSAFE.getLong(addr) + value);
+                    UNSAFE.putInt(addr + 8, UNSAFE.getInt(addr + 8) + 1);
+                    short min = UNSAFE.getShort(addr + 12);
+                    if (value < min)
+                        UNSAFE.putShort(addr + 12, (short) value);
+                    short max = UNSAFE.getShort(addr + 14);
+                    if (value > max)
+                        UNSAFE.putShort(addr + 14, (short) value);
+                    return;
                 }
                 idx = (idx + 1) & mask;
             }
