@@ -31,6 +31,36 @@ import sun.misc.Unsafe;
  * 1BRC solution tuned for Apple Silicon (M1 Pro) instead of the reference
  * EPYC 7502P (Zen2) evaluation box used by the official leaderboard.
  *
+ * v17: adds processSegmentPhased4, a phase-level interleaving alternative to
+ * processSegmentInterleaved4 (row-level) - promoted to the width=4 default
+ * after the A/B below; row-level stays available via
+ * -DM1PRO.interleaveMode=row for further comparison. See
+ * processSegmentPhased4's own Javadoc for the full rationale (re-testing
+ * phase-level interleaving now that v8's fixed 16-byte-window scan has
+ * removed the loop-unrolling problem that sank the original v7 attempt at
+ * this). Two independent, cheap checks preceded this: (1) OffHeapTable's
+ * open-addressing probe stride (+1) was measured, not just reasoned about -
+ * a temporary counter found 1.0557 average probes per update() call (4.33%
+ * of calls need 2+ probes) on a full run, real but modest overhead, not
+ * followed up with a stride change here since it wasn't the subject of this
+ * round; (2) the same probe counter re-run under phased mode measured
+ * 1.0557 again, confirming phasing and probe/collision behavior are
+ * independent, as expected (phasing only changes when table.update() fires
+ * relative to other cursors, not the hash/insertion-order pattern that
+ * determines collisions).
+ *
+ * Result: a real, if modest, win - unlike v16, which moved CPU-seconds and
+ * wall-clock in opposite-or-flat directions (a wash), phasing moved both
+ * together. 5-round A/B, same file, back-to-back: 2.046s/17.52 CPU-s/8.56x
+ * (row-level) vs 1.970s/16.90 CPU-s/8.58x (phased) - about 3.5-3.7% less of
+ * both wall-clock and CPU-seconds, not just better scheduling. Narrows the
+ * gap to thomaswue from ~1.40x to ~1.35x wall-clock (~1.48x to ~1.43x
+ * CPU-seconds). Correctness verified against all 12 sample files plus three
+ * full-file diffs against thomaswue's reference output, in phased mode
+ * specifically (row-level mode was already covered by every prior round's
+ * verification, and stays available as the -DM1PRO.interleaveMode=row
+ * override now that phased is the default).
+ *
  * v16: gives each worker thread one persistent OffHeapTable for its entire
  * run, reused across every chunk it claims off the v15 AtomicLong cursor,
  * instead of a fresh table per chunk. Tried as a targeted test of a specific
@@ -462,6 +492,22 @@ public class CalculateAverage_M1PRO {
     // path, which is *not* a clean comparison against either hand-unrolled path.
     private static final int INTERLEAVE_WIDTH = Integer.getInteger("M1PRO.interleaveWidth", 4);
 
+    // v17: phase-level interleaving is now the default for width=4 (all 4
+    // cursors' scans happen together, then all 4 hash/nameLen computations,
+    // then all 4 number parses, then all 4 table.update() calls) instead of
+    // row-level (each cursor's whole processRow - scan, hash, parse, update -
+    // running to completion before the next cursor starts) - matching
+    // CalculateAverage_thomaswue's own structure, which interleaves at the
+    // phase level. A paired A/B (5 rounds, back-to-back) found phased ~3.5-
+    // 3.7% faster on both wall-clock and CPU-seconds, not just smoother
+    // scheduling - see processSegmentPhased4's Javadoc for the full
+    // rationale, including why this lost when last tried (v7, before v8's
+    // loop-free fixed-window scan existed) but doesn't lose for that same
+    // reason any more. Overridable via -DM1PRO.interleaveMode=row to get the
+    // old row-level path back for further A/B; only width=4 has a phased
+    // variant, since this tests phase-vs-row structure, not distribution.
+    private static final boolean INTERLEAVE_PHASED = !"row".equals(System.getProperty("M1PRO.interleaveMode"));
+
     private static void processSegment(long fileBase, long start, long end, OffHeapTable table) throws Exception {
         long base = fileBase + start;
         int limit = (int) (end - start);
@@ -486,7 +532,12 @@ public class CalculateAverage_M1PRO {
         }
 
         if (INTERLEAVE_WIDTH == 4) {
-            processSegmentInterleaved4(base, limit, table);
+            if (INTERLEAVE_PHASED) {
+                processSegmentPhased4(base, limit, table);
+            }
+            else {
+                processSegmentInterleaved4(base, limit, table);
+            }
             return;
         }
 
@@ -533,12 +584,15 @@ public class CalculateAverage_M1PRO {
     }
 
     /**
-     * v12: hand-unrolled 4-way interleaving, named locals (pos1..pos4), matching
-     * the exact style of the 3-way block above - added specifically because the
-     * general array-based N-way path below was found to carry its own overhead
-     * (even at width=2, slower than the hand-unrolled 3-way baseline), confounding
-     * any real signal about whether a wider width helps on M1 Pro's core. This
-     * isolates the width variable from that array-indexing/JIT-scheduling overhead.
+     * v12: hand-unrolled 4-way row-level interleaving, named locals (pos1..pos4),
+     * matching the exact style of the 3-way block above - added specifically
+     * because the general array-based N-way path below was found to carry its
+     * own overhead (even at width=2, slower than the hand-unrolled 3-way
+     * baseline), confounding any real signal about whether a wider width helps
+     * on M1 Pro's core. This isolates the width variable from that
+     * array-indexing/JIT-scheduling overhead. As of v17, this is no longer the
+     * width=4 default - see processSegmentPhased4 below and INTERLEAVE_PHASED -
+     * but stays available via -DM1PRO.interleaveMode=row for further A/B.
      */
     private static void processSegmentInterleaved4(long base, int limit, OffHeapTable table) {
         int dist = limit / 4;
@@ -560,6 +614,292 @@ public class CalculateAverage_M1PRO {
             pos2 = processRow(base, limit, pos2, table);
             pos3 = processRow(base, limit, pos3, table);
             pos4 = processRow(base, limit, pos4, table);
+        }
+        while (pos1 < end1) {
+            pos1 = processRow(base, limit, pos1, table);
+        }
+        while (pos2 < end2) {
+            pos2 = processRow(base, limit, pos2, table);
+        }
+        while (pos3 < end3) {
+            pos3 = processRow(base, limit, pos3, table);
+        }
+        while (pos4 < end4) {
+            pos4 = processRow(base, limit, pos4, table);
+        }
+    }
+
+    /**
+     * v17: phase-level interleaving, the default for width=4 (see
+     * INTERLEAVE_PHASED; overridable to the row-level path above via
+     * -DM1PRO.interleaveMode=row for further A/B). Row-level interleaving
+     * runs each cursor's whole processRow (scan, hash, parse, table.update())
+     * to completion before the next cursor starts; this instead groups the
+     * same work by phase across all 4 cursors - all 4 scans, then all 4
+     * hash/nameLen computations, then all 4 number parses, then all 4
+     * table.update() calls - matching
+     * CalculateAverage_thomaswue's own structure. The idea: every phase,
+     * including the table update, has 3 other cursors' independent work in
+     * flight to hide its latency, not just the scan phase.
+     *
+     * This was tried once before, in what's now v7 (see the class Javadoc's v8
+     * entry), and lost. That test ran against the old variable-length SWAR
+     * name-scanning loop - unrolling a loop with an unpredictable trip count 3-4
+     * ways creates that many independent, unpredictable loop-back branches for
+     * the scheduler to juggle, which was diagnosed at the time as the actual
+     * reason phase-level interleaving lost, not phase-level grouping itself. v8
+     * (already landed well before this) replaced that loop with the fixed
+     * 16-byte-window scan processRow uses today - the same loop-free property
+     * that makes thomaswue's own interleaving cheap in the first place. Phase-
+     * level interleaving hasn't been re-tried since v8 landed, so this re-tests
+     * it now that its stated reason for losing no longer applies.
+     *
+     * A cursor that can't use the fast 16-byte-window name scan, or whose name
+     * is too close to the segment's end to safely fast-parse the number too,
+     * falls out of the phased batch entirely for that iteration and completes
+     * via the ordinary single-cursor processRow() - simplest correct handling
+     * for what's a rare, segment-tail-only edge case, at the cost of a small
+     * amount of redundant re-scanning for exactly those rows (processRow redoes
+     * the name scan already done in phase 1) - not worth avoiding for how rarely
+     * it triggers.
+     */
+    private static void processSegmentPhased4(long base, int limit, OffHeapTable table) {
+        int dist = limit / 4;
+        int mid1 = nextNewLineBounded(base, dist, limit);
+        int mid2 = nextNewLineBounded(base, dist * 2, limit);
+        int mid3 = nextNewLineBounded(base, dist * 3, limit);
+
+        int pos1 = 0;
+        int end1 = mid1;
+        int pos2 = mid1 + 1;
+        int end2 = mid2;
+        int pos3 = mid2 + 1;
+        int end3 = mid3;
+        int pos4 = mid3 + 1;
+        int end4 = limit;
+
+        while (pos1 < end1 && pos2 < end2 && pos3 < end3 && pos4 < end4) {
+            // Phase 1: all 4 cursors' fixed 16-byte-window name scans, matching
+            // processRow's own fast path. A cursor that can't use it (delimiter
+            // not found in the window, too close to limit, or the number after
+            // it too close to limit to fast-parse) falls back to a plain
+            // processRow() call for its row right here and is done for this
+            // iteration - phases 2-4 skip it.
+            boolean fast1 = false;
+            int nameStart1 = pos1;
+            int nameLen1 = 0, afterDelimiter1 = 0;
+            long word1 = 0, word1b = 0;
+            if (pos1 + 16 <= limit) {
+                word1 = UNSAFE.getLong(base + pos1);
+                word1b = UNSAFE.getLong(base + pos1 + 8);
+                long delimiterMask1 = findDelimiter(word1);
+                long delimiterMask1b = findDelimiter(word1b);
+                if ((delimiterMask1 | delimiterMask1b) != 0) {
+                    int letterCount1 = Long.numberOfTrailingZeros(delimiterMask1) >>> 3;
+                    int letterCount1b = Long.numberOfTrailingZeros(delimiterMask1b) >>> 3;
+                    long sel1 = FAST_MASK2[letterCount1];
+                    nameLen1 = (int) (letterCount1 + (letterCount1b & sel1));
+                    afterDelimiter1 = nameStart1 + nameLen1 + 1;
+                    fast1 = afterDelimiter1 + 8 <= limit;
+                }
+            }
+            if (!fast1) {
+                pos1 = processRow(base, limit, pos1, table);
+            }
+
+            boolean fast2 = false;
+            int nameStart2 = pos2;
+            int nameLen2 = 0, afterDelimiter2 = 0;
+            long word2 = 0, word2b = 0;
+            if (pos2 + 16 <= limit) {
+                word2 = UNSAFE.getLong(base + pos2);
+                word2b = UNSAFE.getLong(base + pos2 + 8);
+                long delimiterMask2 = findDelimiter(word2);
+                long delimiterMask2b = findDelimiter(word2b);
+                if ((delimiterMask2 | delimiterMask2b) != 0) {
+                    int letterCount2 = Long.numberOfTrailingZeros(delimiterMask2) >>> 3;
+                    int letterCount2b = Long.numberOfTrailingZeros(delimiterMask2b) >>> 3;
+                    long sel2 = FAST_MASK2[letterCount2];
+                    nameLen2 = (int) (letterCount2 + (letterCount2b & sel2));
+                    afterDelimiter2 = nameStart2 + nameLen2 + 1;
+                    fast2 = afterDelimiter2 + 8 <= limit;
+                }
+            }
+            if (!fast2) {
+                pos2 = processRow(base, limit, pos2, table);
+            }
+
+            boolean fast3 = false;
+            int nameStart3 = pos3;
+            int nameLen3 = 0, afterDelimiter3 = 0;
+            long word3 = 0, word3b = 0;
+            if (pos3 + 16 <= limit) {
+                word3 = UNSAFE.getLong(base + pos3);
+                word3b = UNSAFE.getLong(base + pos3 + 8);
+                long delimiterMask3 = findDelimiter(word3);
+                long delimiterMask3b = findDelimiter(word3b);
+                if ((delimiterMask3 | delimiterMask3b) != 0) {
+                    int letterCount3 = Long.numberOfTrailingZeros(delimiterMask3) >>> 3;
+                    int letterCount3b = Long.numberOfTrailingZeros(delimiterMask3b) >>> 3;
+                    long sel3 = FAST_MASK2[letterCount3];
+                    nameLen3 = (int) (letterCount3 + (letterCount3b & sel3));
+                    afterDelimiter3 = nameStart3 + nameLen3 + 1;
+                    fast3 = afterDelimiter3 + 8 <= limit;
+                }
+            }
+            if (!fast3) {
+                pos3 = processRow(base, limit, pos3, table);
+            }
+
+            boolean fast4 = false;
+            int nameStart4 = pos4;
+            int nameLen4 = 0, afterDelimiter4 = 0;
+            long word4 = 0, word4b = 0;
+            if (pos4 + 16 <= limit) {
+                word4 = UNSAFE.getLong(base + pos4);
+                word4b = UNSAFE.getLong(base + pos4 + 8);
+                long delimiterMask4 = findDelimiter(word4);
+                long delimiterMask4b = findDelimiter(word4b);
+                if ((delimiterMask4 | delimiterMask4b) != 0) {
+                    int letterCount4 = Long.numberOfTrailingZeros(delimiterMask4) >>> 3;
+                    int letterCount4b = Long.numberOfTrailingZeros(delimiterMask4b) >>> 3;
+                    long sel4 = FAST_MASK2[letterCount4];
+                    nameLen4 = (int) (letterCount4 + (letterCount4b & sel4));
+                    afterDelimiter4 = nameStart4 + nameLen4 + 1;
+                    fast4 = afterDelimiter4 + 8 <= limit;
+                }
+            }
+            if (!fast4) {
+                pos4 = processRow(base, limit, pos4, table);
+            }
+
+            // Phase 2: all 4 cursors' name-word masking + hash, matching
+            // finishRow's own masking logic - only for cursors still in the
+            // phased batch (fast1..fast4).
+            long firstWord1 = 0, secondWord1 = 0;
+            int hash1 = 0;
+            if (fast1) {
+                if (nameLen1 <= 8) {
+                    firstWord1 = word1 & MASK1[nameLen1 - 1];
+                }
+                else if (nameLen1 < 16) {
+                    firstWord1 = word1;
+                    secondWord1 = word1b & MASK1[nameLen1 - 9];
+                }
+                else {
+                    firstWord1 = word1;
+                    secondWord1 = word1b;
+                }
+                long combined1 = firstWord1 ^ secondWord1;
+                hash1 = finishName((int) combined1 ^ (int) (combined1 >>> 32));
+            }
+
+            long firstWord2 = 0, secondWord2 = 0;
+            int hash2 = 0;
+            if (fast2) {
+                if (nameLen2 <= 8) {
+                    firstWord2 = word2 & MASK1[nameLen2 - 1];
+                }
+                else if (nameLen2 < 16) {
+                    firstWord2 = word2;
+                    secondWord2 = word2b & MASK1[nameLen2 - 9];
+                }
+                else {
+                    firstWord2 = word2;
+                    secondWord2 = word2b;
+                }
+                long combined2 = firstWord2 ^ secondWord2;
+                hash2 = finishName((int) combined2 ^ (int) (combined2 >>> 32));
+            }
+
+            long firstWord3 = 0, secondWord3 = 0;
+            int hash3 = 0;
+            if (fast3) {
+                if (nameLen3 <= 8) {
+                    firstWord3 = word3 & MASK1[nameLen3 - 1];
+                }
+                else if (nameLen3 < 16) {
+                    firstWord3 = word3;
+                    secondWord3 = word3b & MASK1[nameLen3 - 9];
+                }
+                else {
+                    firstWord3 = word3;
+                    secondWord3 = word3b;
+                }
+                long combined3 = firstWord3 ^ secondWord3;
+                hash3 = finishName((int) combined3 ^ (int) (combined3 >>> 32));
+            }
+
+            long firstWord4 = 0, secondWord4 = 0;
+            int hash4 = 0;
+            if (fast4) {
+                if (nameLen4 <= 8) {
+                    firstWord4 = word4 & MASK1[nameLen4 - 1];
+                }
+                else if (nameLen4 < 16) {
+                    firstWord4 = word4;
+                    secondWord4 = word4b & MASK1[nameLen4 - 9];
+                }
+                else {
+                    firstWord4 = word4;
+                    secondWord4 = word4b;
+                }
+                long combined4 = firstWord4 ^ secondWord4;
+                hash4 = finishName((int) combined4 ^ (int) (combined4 >>> 32));
+            }
+
+            // Phase 3: all 4 cursors' branchless number parses, matching
+            // finishRow's own fast path.
+            int value1 = 0, newPos1 = afterDelimiter1;
+            if (fast1) {
+                long numberWord1 = UNSAFE.getLong(base + afterDelimiter1);
+                int decimalSepPos1 = Long.numberOfTrailingZeros(~numberWord1 & 0x10101000L);
+                value1 = (int) convertIntoNumber(decimalSepPos1, numberWord1);
+                newPos1 = afterDelimiter1 + (decimalSepPos1 >>> 3) + 3;
+            }
+
+            int value2 = 0, newPos2 = afterDelimiter2;
+            if (fast2) {
+                long numberWord2 = UNSAFE.getLong(base + afterDelimiter2);
+                int decimalSepPos2 = Long.numberOfTrailingZeros(~numberWord2 & 0x10101000L);
+                value2 = (int) convertIntoNumber(decimalSepPos2, numberWord2);
+                newPos2 = afterDelimiter2 + (decimalSepPos2 >>> 3) + 3;
+            }
+
+            int value3 = 0, newPos3 = afterDelimiter3;
+            if (fast3) {
+                long numberWord3 = UNSAFE.getLong(base + afterDelimiter3);
+                int decimalSepPos3 = Long.numberOfTrailingZeros(~numberWord3 & 0x10101000L);
+                value3 = (int) convertIntoNumber(decimalSepPos3, numberWord3);
+                newPos3 = afterDelimiter3 + (decimalSepPos3 >>> 3) + 3;
+            }
+
+            int value4 = 0, newPos4 = afterDelimiter4;
+            if (fast4) {
+                long numberWord4 = UNSAFE.getLong(base + afterDelimiter4);
+                int decimalSepPos4 = Long.numberOfTrailingZeros(~numberWord4 & 0x10101000L);
+                value4 = (int) convertIntoNumber(decimalSepPos4, numberWord4);
+                newPos4 = afterDelimiter4 + (decimalSepPos4 >>> 3) + 3;
+            }
+
+            // Phase 4: all 4 cursors' table.update() calls, last, as their own
+            // batch.
+            if (fast1) {
+                table.update(base + nameStart1, nameLen1, hash1, firstWord1, secondWord1, value1);
+                pos1 = newPos1;
+            }
+            if (fast2) {
+                table.update(base + nameStart2, nameLen2, hash2, firstWord2, secondWord2, value2);
+                pos2 = newPos2;
+            }
+            if (fast3) {
+                table.update(base + nameStart3, nameLen3, hash3, firstWord3, secondWord3, value3);
+                pos3 = newPos3;
+            }
+            if (fast4) {
+                table.update(base + nameStart4, nameLen4, hash4, firstWord4, secondWord4, value4);
+                pos4 = newPos4;
+            }
         }
         while (pos1 < end1) {
             pos1 = processRow(base, limit, pos1, table);
