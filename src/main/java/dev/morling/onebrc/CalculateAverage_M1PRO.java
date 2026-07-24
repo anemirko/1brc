@@ -607,31 +607,69 @@ public class CalculateAverage_M1PRO {
         long combined = firstWord ^ secondWord;
         int hash = finishName((int) combined ^ (int) (combined >>> 32));
 
-        boolean neg = false;
-        byte b = UNSAFE.getByte(base + i);
-        if (b == '-') {
-            neg = true;
-            i++;
-            b = UNSAFE.getByte(base + i);
+        int value;
+        if (i + 8 <= limit) {
+            // Branchless number parse, adapted from CalculateAverage_thomaswue's
+            // convertIntoNumber (itself credited there to Quan Anh Mai). JFR-guided
+            // disassembly comparison (hsdis, C2-compiled hot path) found this was
+            // the single biggest structural gap between the two implementations:
+            // the byte-by-byte loop below compiles to a genuine data-dependent
+            // conditional branch per digit character, while this version is a
+            // fixed-latency shift/mask/multiply with zero data-dependent branches.
+            // Same i+8<=limit guard convention as processRow's own i+16<=limit
+            // check - only the read here, not the fallback below, needs it, since
+            // i+8<=limit also guarantees (by the row format invariant) that a real
+            // '\n' follows the fractional digit, not just segment-mapping safety.
+            long numberWord = UNSAFE.getLong(base + i);
+            int decimalSepPos = Long.numberOfTrailingZeros(~numberWord & 0x10101000L);
+            value = (int) convertIntoNumber(decimalSepPos, numberWord);
+            i += (decimalSepPos >>> 3) + 3;
         }
-        int value = 0;
-        while (b != '.') {
+        else {
+            // Slow path: too close to the segment's own end to safely read 8
+            // bytes unconditionally - same hazard, same convention, as
+            // processRow's i+16<=limit guard on the name side.
+            boolean neg = false;
+            byte b = UNSAFE.getByte(base + i);
+            if (b == '-') {
+                neg = true;
+                i++;
+                b = UNSAFE.getByte(base + i);
+            }
+            value = 0;
+            while (b != '.') {
+                value = value * 10 + (b - '0');
+                i++;
+                b = UNSAFE.getByte(base + i);
+            }
+            i++; // skip '.'
+            b = UNSAFE.getByte(base + i);
             value = value * 10 + (b - '0');
-            i++;
-            b = UNSAFE.getByte(base + i);
+            i++; // skip the single fractional digit
+            if (i < limit && UNSAFE.getByte(base + i) == '\n') {
+                i++;
+            }
+            if (neg)
+                value = -value;
         }
-        i++; // skip '.'
-        b = UNSAFE.getByte(base + i);
-        value = value * 10 + (b - '0');
-        i++; // skip the single fractional digit
-        if (i < limit && UNSAFE.getByte(base + i) == '\n') {
-            i++;
-        }
-        if (neg)
-            value = -value;
 
         table.update(nameStart, nameLen, hash, firstWord, secondWord, value);
         return i;
+    }
+
+    // Branchless ASCII-to-int conversion for values in [-99.9, 99.9] with
+    // exactly one fractional digit - see finishRow's fast path for how
+    // numberWord/decimalSepPos are derived. Verbatim technique from
+    // CalculateAverage_thomaswue::convertIntoNumber (credited there to Quan
+    // Anh Mai); reused as-is since both implementations target the same
+    // official 1BRC value range/format.
+    private static long convertIntoNumber(int decimalSepPos, long numberWord) {
+        int shift = 28 - decimalSepPos;
+        long signed = (~numberWord << 59) >> 63;
+        long designMask = ~(signed & 0xFF);
+        long digits = ((numberWord & designMask) << shift) & 0x0F000F0F00L;
+        long absValue = ((digits * 0x640a0001) >>> 32) & 0x3FF;
+        return (absValue ^ signed) - signed;
     }
 
     /**
