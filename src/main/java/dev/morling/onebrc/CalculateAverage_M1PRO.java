@@ -19,23 +19,74 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.foreign.Arena;
 import java.lang.reflect.Field;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import sun.misc.Unsafe;
 
 /**
  * 1BRC solution tuned for Apple Silicon (M1 Pro) instead of the reference
  * EPYC 7502P (Zen2) evaluation box used by the official leaderboard.
+ *
+ * v15: replaces the precomputed ~102-163 fixed 128MB segments (each handed
+ * to an ExecutorService as one Future) with fine-grained work stealing off
+ * one shared AtomicLong cursor and a plain Thread[] - matching
+ * CalculateAverage_thomaswue's mechanism. Tried because the v14 measurement
+ * showed a smaller CPU-seconds gap to thomaswue (~1.37x) than wall-clock gap
+ * (~1.54x), and the effective-parallelism figures (CPU-seconds/wall-time)
+ * made the reason concrete: thomaswue ~8.11x, this file only ~7.23x on the
+ * same 8 cores - suggesting load imbalance/straggler tail latency, not raw
+ * per-row cost, which argued for finer work-distribution granularity.
+ *
+ * That hypothesis did NOT hold up: a chunk-size sweep from 512KB to 128MB
+ * found wall time monotonically WORSE as chunks got smaller (512KB: 2.87s,
+ * ~6.9x effective parallelism) and monotonically better as chunks got
+ * bigger, plateauing around 8-128MB (all ~2.17-2.23s, ~7.3-7.45x) - the
+ * opposite of what "steal more finely to fix load imbalance" predicts.
+ * thomaswue's own 2MB SEGMENT_SIZE, copied as a starting point, measured as
+ * one of the *worst* points on this machine (2.34s, ~7.2x) - Intel-tuned,
+ * like the 3-way interleaving width before it, and not a fit here either.
+ * 32MB was the best measured point and is the default; see CHUNK_SIZE.
+ *
+ * The actual, smaller win came from a different source than hypothesized:
+ * even at matching 128MB granularity, this simpler AtomicLong+Thread
+ * dispatch beat the old ExecutorService/Future mechanism outright (~1.6%
+ * faster wall-clock, 7.23x -> 7.34x effective parallelism) - task-queue and
+ * Future.get() bookkeeping overhead, not segment size, was worth a small
+ * amount. Combined with the 32MB default: 2.22s/16.05 CPU-s/7.23x (v14) ->
+ * 2.18s/16.07 CPU-s/7.37x - CPU-seconds unchanged, wall-clock and effective
+ * parallelism both modestly better, gap to thomaswue narrows from ~1.54x to
+ * ~1.49x wall-clock (CPU-seconds gap ~1.35x, about the same as before).
+ *
+ * Design choice worth flagging explicitly: each claimed chunk still gets its
+ * own freshly-allocated OffHeapTable (freed via extractRawAndFree() at the
+ * end of that chunk), the same as v14 - NOT a persistent table reused across
+ * every chunk a thread claims over its lifetime, unlike thomaswue's
+ * per-thread Result[] (allocated once, reused for that thread's whole run).
+ * A persistent table was the more direct match to thomaswue's own structure
+ * and was considered, but OffHeapTable's slots store each name's location as
+ * a 4-byte int offset relative to the table's own segmentBase (see slot
+ * layout below) - correct only because, until now, that base was always a
+ * single chunk's own start. A table reused across chunks scattered
+ * throughout a 13GB file would need those offsets to survive a change of
+ * base between chunks, which the current 4-byte-int/single-base-per-table
+ * layout can't represent (13GB overflows a 4-byte offset from a single
+ * fixed base; correctly supporting it needs either widening the offset to
+ * 8 bytes or storing a base pointer per slot, both touching the exact
+ * update()/slot-layout code the OffHeapTable-vs-thomaswue disassembly
+ * comparison already found lean and clean) - out of scope for a
+ * granularity-only change. The chunk-size sweep above is itself indirect
+ * evidence this matters: wall time degrading sharply at small chunk
+ * sizes tracks allocating+zeroing a fresh ~1MB OffHeapTable far more often
+ * (up to ~26,000 times at 512KB chunks for this 13GB file, vs ~102 times at
+ * the old fixed 128MB granularity) - exactly the cost a persistent table
+ * would avoid. Worth a follow-up if finer-grained stealing is revisited.
  *
  * v14: maps the whole file exactly once, up front, via
  * FileChannel.map(..., Arena.global()) - matching CalculateAverage_thomaswue -
@@ -114,11 +165,11 @@ import sun.misc.Unsafe;
  *    of this file capped the thread count below the real P-core count to
  *    "leave headroom" for the OS, but a paired A/B on this repo's own
  *    RAM-disk benchmark found no such downside - using every P-core was
- *    consistently faster. Segments are sized small (see MAX_SEGMENT_SIZE,
- *    not 1:1 with thread count) so this is still ordinary work-stealing:
- *    whichever cores we actually get, a fast thread just pulls more
- *    segments and a slow one pulls fewer - nobody blocks waiting on a
- *    fixed, possibly-mis-assigned chunk.
+ *    consistently faster. As of v15, work distribution is genuine
+ *    fine-grained stealing off a shared cursor (see CHUNK_SIZE), not just
+ *    small fixed segments handed out up front: whichever cores we actually
+ *    get, a fast thread just claims more chunks and a slow one claims
+ *    fewer - nobody blocks waiting on a fixed, possibly-mis-assigned chunk.
  *
  * 2. No jdk.incubator.vector. Requesting a 256-bit ByteVector species on
  *    hardware that only has 128-bit NEON makes the JVM silently fall back
@@ -156,13 +207,6 @@ import sun.misc.Unsafe;
  * that API is no longer a preview feature)
  */
 public class CalculateAverage_M1PRO {
-
-    // Deliberately small relative to the file size (not "file size / thread
-    // count") - see class Javadoc point 1 on why (no core-affinity control
-    // on macOS, so fine-grained work-stealing instead). Also keeps each
-    // segment's (int) length (used throughout as `limit`) well under
-    // Integer.MAX_VALUE.
-    private static final long MAX_SEGMENT_SIZE = 128_000_000L;
 
     private static final long BROADCAST_01 = 0x0101010101010101L;
     private static final long BROADCAST_80 = 0x8080808080808080L;
@@ -239,27 +283,60 @@ public class CalculateAverage_M1PRO {
             // with no explicit keepAlive/reachabilityFence needed - see class
             // Javadoc.
             long fileBase = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
+            long fileEnd = fileBase + fileSize;
             int numThreads = performanceCoreCount();
-            List<long[]> segments = computeSegments(channel, fileSize);
 
-            ExecutorService pool = Executors.newFixedThreadPool(numThreads);
-            List<Future<List<RawEntry>>> futures = new ArrayList<>();
-            for (long[] seg : segments) {
-                final long segStart = seg[0];
-                final long segEnd = seg[1];
-                futures.add(pool.submit(() -> processSegment(fileBase, segStart, segEnd)));
+            // v15: fine-grained work stealing off one shared cursor, matching
+            // CalculateAverage_thomaswue, instead of precomputing ~102-163
+            // fixed 128MB segments and handing each to the ExecutorService as
+            // one Future - see class Javadoc for the rationale (measured
+            // effective-parallelism gap vs thomaswue) and the chunk-size
+            // sweep results.
+            AtomicLong cursor = new AtomicLong(fileBase);
+            Thread[] threads = new Thread[numThreads];
+            List<RawEntry>[] threadResults = new List[numThreads];
+            for (int t = 0; t < numThreads; t++) {
+                final int index = t;
+                threads[t] = new Thread(() -> {
+                    List<RawEntry> collected = new ArrayList<>();
+                    while (true) {
+                        long current = cursor.addAndGet(CHUNK_SIZE) - CHUNK_SIZE;
+                        if (current >= fileEnd) {
+                            break;
+                        }
+                        long chunkEnd = findNextNewlineInFile(Math.min(fileEnd - 1, current + CHUNK_SIZE));
+                        long chunkStart = (current == fileBase) ? current : findNextNewlineInFile(current) + 1;
+                        if (chunkStart >= chunkEnd) {
+                            // Degenerate claim: this thread's slice landed entirely
+                            // inside a row its predecessor already owns (possible
+                            // when CHUNK_SIZE is smaller than one row, or right at
+                            // EOF) - nothing of this thread's own to process.
+                            continue;
+                        }
+                        try {
+                            collected.addAll(processSegment(fileBase, chunkStart - fileBase, chunkEnd - fileBase));
+                        }
+                        catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    threadResults[index] = collected;
+                });
+                threads[t].start();
+            }
+            for (Thread thread : threads) {
+                thread.join();
             }
 
             // Single global merge, raw-byte comparisons only. A String is
             // materialized at most once per genuinely unique station name
             // (not once per segment) - see class Javadoc.
             GlobalTable global = new GlobalTable();
-            for (Future<List<RawEntry>> f : futures) {
-                for (RawEntry e : f.get()) {
+            for (List<RawEntry> results : threadResults) {
+                for (RawEntry e : results) {
                     global.merge(e);
                 }
             }
-            pool.shutdown();
             merged = global.toResults();
         }
 
@@ -305,38 +382,38 @@ public class CalculateAverage_M1PRO {
         return Math.min(Math.max(1, Runtime.getRuntime().availableProcessors()), MAX_THREADS);
     }
 
-    /** Split the file into <2GB chunks aligned on row boundaries. */
-    private static List<long[]> computeSegments(FileChannel channel, long fileSize) throws Exception {
-        List<long[]> segments = new ArrayList<>();
-        long pos = 0;
-        while (pos < fileSize) {
-            long end = Math.min(pos + MAX_SEGMENT_SIZE, fileSize);
-            if (end < fileSize) {
-                end = findNextNewline(channel, end);
-            }
-            segments.add(new long[]{ pos, end });
-            pos = end;
-        }
-        return segments;
-    }
+    // v15: chunk size for the shared-cursor work-stealing loop in main() -
+    // see class Javadoc for the sweep that picked this default. thomaswue's
+    // own SEGMENT_SIZE (2MB, tuned for an Intel i9-13900K) was the starting
+    // point, not assumed optimal here - and measured out to be a bad fit: a
+    // sweep from 512KB to 128MB found wall time monotonically *improving* as
+    // chunks got bigger (2MB: 2.34s -> 32MB: 2.17s), the opposite of what
+    // "steal more finely to fix load imbalance" predicts. 32MB was the best
+    // measured point (a shallow plateau from ~8MB-128MB, all within ~2% of
+    // each other). Overridable via -DM1PRO.chunkSize=N for further tuning.
+    private static final long CHUNK_SIZE = Long.getLong("M1PRO.chunkSize", 32L * 1024 * 1024);
 
-    private static long findNextNewline(FileChannel channel, long from) throws Exception {
-        ByteBuffer buf = ByteBuffer.allocate(1 << 16);
-        long pos = from;
-        long size = channel.size();
-        while (pos < size) {
-            buf.clear();
-            int n = channel.read(buf, pos);
-            if (n <= 0)
-                break;
-            for (int i = 0; i < n; i++) {
-                if (buf.get(i) == '\n') {
-                    return pos + i + 1;
-                }
+    /**
+     * Finds the next '\n' at or after the absolute address {@code pos},
+     * unbounded - matching CalculateAverage_thomaswue's nextNewLine. Safe to
+     * read slightly past the file's true end because the whole file is one
+     * mmap (see main()'s v14 note): the OS zero-pads the final partial page,
+     * and every caller here first clamps {@code pos} to at most fileEnd-1
+     * (see main()), so the 8-byte read this does never crosses into an
+     * unmapped page. Unlike nextNewLineBounded (used inside a claimed
+     * chunk), this has no separate `limit` - the "whole file" bound already
+     * comes from the caller-supplied Math.min(fileEnd-1, ...) clamp.
+     */
+    private static long findNextNewlineInFile(long pos) {
+        while (true) {
+            long word = UNSAFE.getLong(pos);
+            long input = word ^ NEWLINE_PATTERN;
+            long mask = (input - BROADCAST_01) & ~input & BROADCAST_80;
+            if (mask != 0) {
+                return pos + (Long.numberOfTrailingZeros(mask) >>> 3);
             }
-            pos += n;
+            pos += 8;
         }
-        return size;
     }
 
     // Overridable via -DM1PRO.interleave=false for A/B testing against
