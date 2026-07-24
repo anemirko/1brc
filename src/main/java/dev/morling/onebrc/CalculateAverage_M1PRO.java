@@ -1141,7 +1141,9 @@ public class CalculateAverage_M1PRO {
     }
 
     private static int finishName(int hash) {
-        return hash ^ (hash >>> 16);
+        hash ^= hash >>> 16;
+        hash *= 0x85ebca6b;
+        return hash ^ (hash >>> 13);
     }
 
     private static boolean regionEquals(long addrA, long addrB, int len) {
@@ -1196,7 +1198,7 @@ public class CalculateAverage_M1PRO {
      * with no intermediate allocation.
      */
     private static final class OffHeapTable {
-        private int capacity = 1 << 14; // 16384 slots * 32B = 512KB
+        private int capacity = 1 << 14; // 16384 slots * 64B = 1MiB
         private int mask = capacity - 1;
         private long table = UNSAFE.allocateMemory((long) capacity * SLOT_SIZE);
         private int size = 0;
