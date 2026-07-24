@@ -31,6 +31,24 @@ import sun.misc.Unsafe;
  * 1BRC solution tuned for Apple Silicon (M1 Pro) instead of the reference
  * EPYC 7502P (Zen2) evaluation box used by the official leaderboard.
  *
+ * v18: makes the packed two-word station key delimiter-inclusive, matching
+ * thomaswue's representation, so the phased hot path no longer needs a
+ * three-way branch on name length to mask the key. The selector that says
+ * whether the second word participates is computed arithmetically
+ * ({@code -(length >>> 3)}) instead of loaded from FAST_MASK2. The slow path
+ * uses the same representation, so a station still has one canonical hash
+ * and key regardless of where its row falls.
+ *
+ * This targets an actually unpredictable branch: 272 of the standard 413
+ * station names are at most eight bytes, and rows select stations uniformly,
+ * making the main split roughly 66/34. Two direct, reversed-order full-file
+ * A/B pairs against the frozen v17 jar measured 12.214s/10.12 user CPU-s
+ * (v17) versus 12.090s/8.29 user CPU-s (v18): about 1.0% less wall time and
+ * 18% less parser CPU. Wall time moved much less because this measurement
+ * session was storage-bound; a one-worker control spent ~57s wall time but
+ * only ~12s total CPU. Correctness was verified against the full 1B-row
+ * output and every sample in phased, row-level, and non-interleaved modes.
+ *
  * v17: adds processSegmentPhased4, a phase-level interleaving alternative to
  * processSegmentInterleaved4 (row-level) - promoted to the width=4 default
  * after the A/B below; row-level stays available via
@@ -267,9 +285,10 @@ import sun.misc.Unsafe;
  *    (offset, length) pairs into the already-mapped file - no per-insert
  *    byte[] allocation, and (per the v3 fix above) no String materialization
  *    until the final, tiny, cross-thread merge step. Each slot also carries
- *    the name's first 16 bytes packed into two longs (per the v5 fix below)
- *    so most lookups resolve with one or two register compares instead of a
- *    byte-scanning function call. The default table size (2^14 slots = 1 MB)
+ *    a delimiter-inclusive prefix packed into two longs (v18; originally
+ *    the name's first 16 bytes in v5), so most lookups resolve with one or
+ *    two register compares instead of a byte-scanning function call. The
+ *    default table size (2^14 slots = 1 MB)
  *    comfortably fits inside M1 Pro's 24 MB shared P-cluster L2 - EPYC's L2
  *    is only 512 KB *per core*, so a size tuned to survive there would
  *    badly under-use what M1 Pro actually has available.
@@ -301,24 +320,15 @@ public class CalculateAverage_M1PRO {
     // 24: short keyLen (0 == empty slot sentinel; no station name is empty)
     // 26: short pad
     // 28: int hash (precomputed, avoids re-hashing bytes on resize)
-    // 32: long firstNameWord (v5: first 8 bytes of the name, zero-padded if shorter)
-    // 40: long secondNameWord (v5: next 8 bytes, zero-padded if the name is <=16 bytes)
+    // 32: long firstNameWord (first 8 bytes of the delimiter-inclusive packed key)
+    // 40: long secondNameWord (next 8 bytes, zero-padded when unused)
     // 48: 16 bytes pad, rounds the slot out to one cache line
 
-    // v5: masks the low N bytes of a long, used to zero-pad firstNameWord/secondNameWord
-    // for names shorter than 8/16 bytes so two different-length names never compare equal
-    // by accident. MASK1[k] keeps the low (k+1) bytes (credit: this repo's
-    // CalculateAverage_thomaswue, which uses the identical trick).
+    // Masks the low N bytes of a long. Packed name words include the trailing
+    // semicolon, matching CalculateAverage_thomaswue, so MASK1[k] keeps the
+    // first k+1 bytes and index 8 means an unmasked full word.
     private static final long[] MASK1 = { 0xFFL, 0xFFFFL, 0xFFFFFFL, 0xFFFFFFFFL, 0xFFFFFFFFFFL, 0xFFFFFFFFFFFFL,
-            0xFFFFFFFFFFFFFFL, 0xFFFFFFFFFFFFFFFFL };
-
-    // v8: used only to determine nameLen via the fixed 16-byte-window fast path in
-    // processRow (see there) - 0 when the delimiter was found within the first 8
-    // bytes (word1's own letterCount1 already covers the whole name), all-ones when
-    // it wasn't (so word2's letterCount2 also needs to count toward nameLen).
-    // Index 8 means "not found in word1 at all". Exact technique and array from
-    // this repo's CalculateAverage_thomaswue.
-    private static final long[] FAST_MASK2 = { 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0xFFFFFFFFFFFFFFFFL };
+            0xFFFFFFFFFFFFFFL, 0xFFFFFFFFFFFFFFFFL, 0xFFFFFFFFFFFFFFFFL };
 
     private static final Unsafe UNSAFE = getUnsafe();
 
@@ -697,8 +707,8 @@ public class CalculateAverage_M1PRO {
                 if ((delimiterMask1 | delimiterMask1b) != 0) {
                     int letterCount1 = Long.numberOfTrailingZeros(delimiterMask1) >>> 3;
                     int letterCount1b = Long.numberOfTrailingZeros(delimiterMask1b) >>> 3;
-                    long sel1 = FAST_MASK2[letterCount1];
-                    nameLen1 = (int) (letterCount1 + (letterCount1b & sel1));
+                    int sel1 = -(letterCount1 >>> 3);
+                    nameLen1 = letterCount1 + (letterCount1b & sel1);
                     afterDelimiter1 = nameStart1 + nameLen1 + 1;
                     fast1 = afterDelimiter1 + 8 <= limit;
                 }
@@ -719,8 +729,8 @@ public class CalculateAverage_M1PRO {
                 if ((delimiterMask2 | delimiterMask2b) != 0) {
                     int letterCount2 = Long.numberOfTrailingZeros(delimiterMask2) >>> 3;
                     int letterCount2b = Long.numberOfTrailingZeros(delimiterMask2b) >>> 3;
-                    long sel2 = FAST_MASK2[letterCount2];
-                    nameLen2 = (int) (letterCount2 + (letterCount2b & sel2));
+                    int sel2 = -(letterCount2 >>> 3);
+                    nameLen2 = letterCount2 + (letterCount2b & sel2);
                     afterDelimiter2 = nameStart2 + nameLen2 + 1;
                     fast2 = afterDelimiter2 + 8 <= limit;
                 }
@@ -741,8 +751,8 @@ public class CalculateAverage_M1PRO {
                 if ((delimiterMask3 | delimiterMask3b) != 0) {
                     int letterCount3 = Long.numberOfTrailingZeros(delimiterMask3) >>> 3;
                     int letterCount3b = Long.numberOfTrailingZeros(delimiterMask3b) >>> 3;
-                    long sel3 = FAST_MASK2[letterCount3];
-                    nameLen3 = (int) (letterCount3 + (letterCount3b & sel3));
+                    int sel3 = -(letterCount3 >>> 3);
+                    nameLen3 = letterCount3 + (letterCount3b & sel3);
                     afterDelimiter3 = nameStart3 + nameLen3 + 1;
                     fast3 = afterDelimiter3 + 8 <= limit;
                 }
@@ -763,8 +773,8 @@ public class CalculateAverage_M1PRO {
                 if ((delimiterMask4 | delimiterMask4b) != 0) {
                     int letterCount4 = Long.numberOfTrailingZeros(delimiterMask4) >>> 3;
                     int letterCount4b = Long.numberOfTrailingZeros(delimiterMask4b) >>> 3;
-                    long sel4 = FAST_MASK2[letterCount4];
-                    nameLen4 = (int) (letterCount4 + (letterCount4b & sel4));
+                    int sel4 = -(letterCount4 >>> 3);
+                    nameLen4 = letterCount4 + (letterCount4b & sel4);
                     afterDelimiter4 = nameStart4 + nameLen4 + 1;
                     fast4 = afterDelimiter4 + 8 <= limit;
                 }
@@ -779,17 +789,10 @@ public class CalculateAverage_M1PRO {
             long firstWord1 = 0, secondWord1 = 0;
             int hash1 = 0;
             if (fast1) {
-                if (nameLen1 <= 8) {
-                    firstWord1 = word1 & MASK1[nameLen1 - 1];
-                }
-                else if (nameLen1 < 16) {
-                    firstWord1 = word1;
-                    secondWord1 = word1b & MASK1[nameLen1 - 9];
-                }
-                else {
-                    firstWord1 = word1;
-                    secondWord1 = word1b;
-                }
+                int word1Length = Math.min(nameLen1, 8);
+                int word2Length = nameLen1 - word1Length;
+                firstWord1 = word1 & MASK1[word1Length];
+                secondWord1 = -(long) (word1Length >>> 3) & word1b & MASK1[word2Length];
                 long combined1 = firstWord1 ^ secondWord1;
                 hash1 = finishName((int) combined1 ^ (int) (combined1 >>> 32));
             }
@@ -797,17 +800,10 @@ public class CalculateAverage_M1PRO {
             long firstWord2 = 0, secondWord2 = 0;
             int hash2 = 0;
             if (fast2) {
-                if (nameLen2 <= 8) {
-                    firstWord2 = word2 & MASK1[nameLen2 - 1];
-                }
-                else if (nameLen2 < 16) {
-                    firstWord2 = word2;
-                    secondWord2 = word2b & MASK1[nameLen2 - 9];
-                }
-                else {
-                    firstWord2 = word2;
-                    secondWord2 = word2b;
-                }
+                int word1Length = Math.min(nameLen2, 8);
+                int word2Length = nameLen2 - word1Length;
+                firstWord2 = word2 & MASK1[word1Length];
+                secondWord2 = -(long) (word1Length >>> 3) & word2b & MASK1[word2Length];
                 long combined2 = firstWord2 ^ secondWord2;
                 hash2 = finishName((int) combined2 ^ (int) (combined2 >>> 32));
             }
@@ -815,17 +811,10 @@ public class CalculateAverage_M1PRO {
             long firstWord3 = 0, secondWord3 = 0;
             int hash3 = 0;
             if (fast3) {
-                if (nameLen3 <= 8) {
-                    firstWord3 = word3 & MASK1[nameLen3 - 1];
-                }
-                else if (nameLen3 < 16) {
-                    firstWord3 = word3;
-                    secondWord3 = word3b & MASK1[nameLen3 - 9];
-                }
-                else {
-                    firstWord3 = word3;
-                    secondWord3 = word3b;
-                }
+                int word1Length = Math.min(nameLen3, 8);
+                int word2Length = nameLen3 - word1Length;
+                firstWord3 = word3 & MASK1[word1Length];
+                secondWord3 = -(long) (word1Length >>> 3) & word3b & MASK1[word2Length];
                 long combined3 = firstWord3 ^ secondWord3;
                 hash3 = finishName((int) combined3 ^ (int) (combined3 >>> 32));
             }
@@ -833,17 +822,10 @@ public class CalculateAverage_M1PRO {
             long firstWord4 = 0, secondWord4 = 0;
             int hash4 = 0;
             if (fast4) {
-                if (nameLen4 <= 8) {
-                    firstWord4 = word4 & MASK1[nameLen4 - 1];
-                }
-                else if (nameLen4 < 16) {
-                    firstWord4 = word4;
-                    secondWord4 = word4b & MASK1[nameLen4 - 9];
-                }
-                else {
-                    firstWord4 = word4;
-                    secondWord4 = word4b;
-                }
+                int word1Length = Math.min(nameLen4, 8);
+                int word2Length = nameLen4 - word1Length;
+                firstWord4 = word4 & MASK1[word1Length];
+                secondWord4 = -(long) (word1Length >>> 3) & word4b & MASK1[word2Length];
                 long combined4 = firstWord4 ^ secondWord4;
                 hash4 = finishName((int) combined4 ^ (int) (combined4 >>> 32));
             }
@@ -977,15 +959,12 @@ public class CalculateAverage_M1PRO {
      * loop-back branches for the scheduler to juggle, unlike thomaswue's
      * fixed, loop-free 16-byte window, which is what actually made his
      * interleaving cheap. This replaces the loop for the common case (name
-     * <=16 bytes); the loop remains only as a fallback for the rare longer
-     * names, or when too close to the segment's own end to safely read 16
-     * bytes unconditionally. Unlike thomaswue's own fast path, the masked
-     * word used for hashing/comparison is computed the same way (via
-     * finishRow, below) regardless of which path determined nameLen - the
-     * fast path only determines nameLen faster here, it doesn't reuse
-     * thomaswue's exact (delimiter-inclusive) word masking, so there's no
-     * risk of the same station producing inconsistent hash/comparison words
-     * depending on which path a given occurrence happens to take.
+     * <=15 bytes, so the delimiter is inside that window); the loop remains
+     * only as a fallback for rare longer names, or when too close to the
+     * segment's own end to safely read 16 bytes unconditionally. As of v18,
+     * both paths produce the same
+     * delimiter-inclusive packed key, so a station's hash and comparison
+     * words do not depend on which path found it.
      */
     private static int processRow(long base, int limit, int i, OffHeapTable table) {
         int nameStart = i;
@@ -998,8 +977,8 @@ public class CalculateAverage_M1PRO {
             if ((delimiterMask | delimiterMask2) != 0) {
                 int letterCount1 = Long.numberOfTrailingZeros(delimiterMask) >>> 3;
                 int letterCount2 = Long.numberOfTrailingZeros(delimiterMask2) >>> 3;
-                long sel = FAST_MASK2[letterCount1];
-                int nameLen = (int) (letterCount1 + (letterCount2 & sel));
+                int sel = -(letterCount1 >>> 3);
+                int nameLen = letterCount1 + (letterCount2 & sel);
                 int afterDelimiter = nameStart + nameLen + 1;
                 return finishRow(base, limit, nameStart, nameLen, afterDelimiter, word, word2, table);
             }
@@ -1028,21 +1007,21 @@ public class CalculateAverage_M1PRO {
     }
 
     /**
-     * Shared tail for both processRow() paths: masks word/word2 down to the
-     * name's true length (same convention regardless of which path found
-     * nameLen), derives a hash from the masked words, parses the number, and
+     * Shared tail for both processRow() paths: masks word/word2 through the
+     * trailing semicolon (same convention regardless of which path found
+     * nameLen), derives a hash from the packed words, parses the number, and
      * updates the table. {@code i} is the position right after the ';'.
      */
     private static int finishRow(long base, int limit, int nameStart, int nameLen, int i, long word, long word2, OffHeapTable table) {
         long firstWord;
         long secondWord;
-        if (nameLen <= 8) {
-            firstWord = word & MASK1[nameLen - 1];
+        if (nameLen < 8) {
+            firstWord = word & MASK1[nameLen];
             secondWord = 0;
         }
         else if (nameLen < 16) {
             firstWord = word;
-            secondWord = word2 & MASK1[nameLen - 9];
+            secondWord = word2 & MASK1[nameLen - 8];
         }
         else {
             firstWord = word;
