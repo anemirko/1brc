@@ -17,14 +17,13 @@ package dev.morling.onebrc;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
-import java.io.RandomAccessFile;
-import java.lang.ref.Reference;
+import java.lang.foreign.Arena;
 import java.lang.reflect.Field;
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -37,6 +36,24 @@ import sun.misc.Unsafe;
 /**
  * 1BRC solution tuned for Apple Silicon (M1 Pro) instead of the reference
  * EPYC 7502P (Zen2) evaluation box used by the official leaderboard.
+ *
+ * v14: maps the whole file exactly once, up front, via
+ * FileChannel.map(..., Arena.global()) - matching CalculateAverage_thomaswue -
+ * instead of processSegment() calling channel.map() separately for every
+ * segment (~102-163 times for a 13GB file at MAX_SEGMENT_SIZE). Tried after
+ * disassembly comparisons of the hot-path methods (finishRow/processRow,
+ * OffHeapTable.update() vs thomaswue's findResult+record, 4-way vs 3-way
+ * interleaving) all came back clean - no fixable per-row instruction-count
+ * waste left to find, so this tests the one remaining structural difference:
+ * per-segment page-table setup cost paid ~150 times instead of once. Each
+ * worker still gets its own [start,end) row-aligned range from
+ * computeSegments() exactly as before; the only change is that range is now
+ * an offset into one shared mapping instead of the arguments to its own
+ * mapping call. This also lets RawEntry's lifetime drop the old
+ * keepAlive-list/reachabilityFence machinery entirely - Arena.global() keeps
+ * the whole file mapped for the JVM's lifetime, so there's nothing per-segment
+ * left to keep reachable. See the benchmark note on processSegment() for
+ * whether this measured as a real win.
  *
  * v8: replaces the variable-length SWAR name-scanning loop with
  * CalculateAverage_thomaswue's fixed 16-byte-window technique - see the
@@ -81,10 +98,10 @@ import sun.misc.Unsafe;
  * GlobalTable merges those across all segments comparing raw bytes (cheap,
  * same trick as the per-segment table), and only materializes a String the
  * first time a name is genuinely new *globally* - at most ~413 times for
- * the standard dataset, not once per segment. Segments' MappedByteBuffers
- * are kept reachable (via an explicit keepAlive list + a reachabilityFence)
- * until that merge/decode is done, since RawEntry only carries a raw long
- * address, which is invisible to the JVM's own escape analysis/GC.
+ * the standard dataset, not once per segment. (As of v14, RawEntry's base
+ * address points into the one whole-file mapping, kept alive automatically
+ * for the JVM's lifetime by Arena.global() - no explicit keepAlive/
+ * reachabilityFence needed any more; see the v14 note above.)
  *
  * Design choices:
  *
@@ -114,12 +131,12 @@ import sun.misc.Unsafe;
  * 3. sun.misc.Unsafe for every hot-path memory access, matching what the
  *    reference x86 solutions do. buffer.get(i) on a MappedByteBuffer goes
  *    through bounds checks and a virtual dispatch (DirectByteBuffer vs
- *    HeapByteBuffer); Unsafe.getByte/getLong(address) is one raw load. We
- *    also read the buffer's native base address once via reflection
- *    (Buffer.address) instead of paying that cost per access. Trade-off:
- *    unlike ByteBuffer, out-of-bounds access here is a JVM-crashing SIGSEGV,
- *    not a catchable exception - fine for well-formed input, not forgiving
- *    of truncated/malformed files.
+ *    HeapByteBuffer); Unsafe.getByte/getLong(address) is one raw load. The
+ *    file's native base address is obtained once, up front, via
+ *    MemorySegment.address() (see main()'s v14 note) instead of paying that
+ *    cost per access. Trade-off: unlike ByteBuffer, out-of-bounds access
+ *    here is a JVM-crashing SIGSEGV, not a catchable exception - fine for
+ *    well-formed input, not forgiving of truncated/malformed files.
  *
  * 4. Off-heap, fixed-stride (64 bytes = one M1/EPYC cache line) hash table
  *    instead of parallel Java arrays. Station keys are stored as zero-copy
@@ -133,16 +150,18 @@ import sun.misc.Unsafe;
  *    is only 512 KB *per core*, so a size tuned to survive there would
  *    badly under-use what M1 Pro actually has available.
  *
- * Usage: java --add-opens java.base/java.nio=ALL-UNNAMED \
- *             CalculateAverage_M1PRO measurements.txt
- * (the --add-opens flag is only required on JDK 16+; harmless before that)
+ * Usage: java --enable-preview CalculateAverage_M1PRO measurements.txt
+ * (--enable-preview is required for java.lang.foreign.Arena on this
+ * project's target JDK; drop it once the project moves to JDK 22+, where
+ * that API is no longer a preview feature)
  */
 public class CalculateAverage_M1PRO {
 
     // Deliberately small relative to the file size (not "file size / thread
     // count") - see class Javadoc point 1 on why (no core-affinity control
     // on macOS, so fine-grained work-stealing instead). Also keeps each
-    // MappedByteBuffer well under Integer.MAX_VALUE.
+    // segment's (int) length (used throughout as `limit`) well under
+    // Integer.MAX_VALUE.
     private static final long MAX_SEGMENT_SIZE = 128_000_000L;
 
     private static final long BROADCAST_01 = 0x0101010101010101L;
@@ -208,47 +227,41 @@ public class CalculateAverage_M1PRO {
         long t0 = System.nanoTime();
 
         List<Result> merged;
-        // Kept alive only so the JVM can't unmap a segment's MappedByteBuffer
-        // while GlobalTable still holds raw addresses pointing into it - see
-        // class Javadoc on the v3 String-materialization fix.
-        List<MappedByteBuffer> keepAlive = new ArrayList<>();
 
-        try (RandomAccessFile raf = new RandomAccessFile(fileName, "r");
-                FileChannel channel = raf.getChannel()) {
+        try (FileChannel channel = FileChannel.open(Path.of(fileName), StandardOpenOption.READ)) {
 
             long fileSize = channel.size();
+            // v14: map the whole file exactly once, up front - matching
+            // CalculateAverage_thomaswue - instead of processSegment() mapping
+            // its own sub-range separately for every segment. Arena.global()
+            // keeps this mapping alive for the JVM's lifetime, so RawEntry's
+            // raw addresses (computed as fileBase+offset below) stay valid
+            // with no explicit keepAlive/reachabilityFence needed - see class
+            // Javadoc.
+            long fileBase = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
             int numThreads = performanceCoreCount();
             List<long[]> segments = computeSegments(channel, fileSize);
 
             ExecutorService pool = Executors.newFixedThreadPool(numThreads);
-            List<Future<SegmentOutput>> futures = new ArrayList<>();
+            List<Future<List<RawEntry>>> futures = new ArrayList<>();
             for (long[] seg : segments) {
                 final long segStart = seg[0];
                 final long segEnd = seg[1];
-                futures.add(pool.submit(() -> processSegment(channel, segStart, segEnd)));
+                futures.add(pool.submit(() -> processSegment(fileBase, segStart, segEnd)));
             }
 
             // Single global merge, raw-byte comparisons only. A String is
             // materialized at most once per genuinely unique station name
             // (not once per segment) - see class Javadoc.
             GlobalTable global = new GlobalTable();
-            for (Future<SegmentOutput> f : futures) {
-                SegmentOutput out = f.get();
-                keepAlive.add(out.buffer);
-                for (RawEntry e : out.entries) {
+            for (Future<List<RawEntry>> f : futures) {
+                for (RawEntry e : f.get()) {
                     global.merge(e);
                 }
             }
             pool.shutdown();
             merged = global.toResults();
         }
-
-        // Guarantees keepAlive (and everything it holds) is still reachable
-        // through the point where GlobalTable finished reading raw bytes out
-        // of those mappings - guards against the JVM proving the list "dead"
-        // early via escape analysis, since RawEntry's raw long address is
-        // invisible to it as a dependency on the MappedByteBuffer object.
-        Reference.reachabilityFence(keepAlive);
 
         System.out.println(formatResults(merged));
         double elapsed = (System.nanoTime() - t0) / 1e9;
@@ -326,19 +339,6 @@ public class CalculateAverage_M1PRO {
         return size;
     }
 
-    /** Raw native base address of a direct/mapped buffer (Buffer.address). */
-    private static long addressOf(Buffer buffer) {
-        try {
-            Field addressField = Buffer.class.getDeclaredField("address");
-            addressField.setAccessible(true);
-            return addressField.getLong(buffer);
-        }
-        catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Cannot obtain direct buffer address - on JDK 16+ "
-                    + "run with --add-opens java.base/java.nio=ALL-UNNAMED", e);
-        }
-    }
-
     // Overridable via -DM1PRO.interleave=false for A/B testing against
     // the plain single-cursor sweep - see processSegment.
     private static final boolean INTERLEAVE = !"false".equals(System.getProperty("M1PRO.interleave"));
@@ -355,9 +355,8 @@ public class CalculateAverage_M1PRO {
     // path, which is *not* a clean comparison against either hand-unrolled path.
     private static final int INTERLEAVE_WIDTH = Integer.getInteger("M1PRO.interleaveWidth", 4);
 
-    private static SegmentOutput processSegment(FileChannel channel, long start, long end) throws Exception {
-        MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, start, end - start);
-        long base = addressOf(buffer);
+    private static List<RawEntry> processSegment(long fileBase, long start, long end) throws Exception {
+        long base = fileBase + start;
         int limit = (int) (end - start);
 
         OffHeapTable table = new OffHeapTable(base);
@@ -378,15 +377,15 @@ public class CalculateAverage_M1PRO {
             while (i < limit) {
                 i = processRow(base, limit, i, table);
             }
-            return new SegmentOutput(buffer, table.extractRawAndFree());
+            return table.extractRawAndFree();
         }
 
         if (INTERLEAVE_WIDTH == 4) {
-            return processSegmentInterleaved4(base, limit, table, buffer);
+            return processSegmentInterleaved4(base, limit, table);
         }
 
         if (INTERLEAVE_WIDTH != 3) {
-            return processSegmentInterleavedN(base, limit, table, buffer);
+            return processSegmentInterleavedN(base, limit, table);
         }
 
         // v4: split the segment into three roughly equal, row-aligned parts
@@ -425,7 +424,7 @@ public class CalculateAverage_M1PRO {
             pos3 = processRow(base, limit, pos3, table);
         }
 
-        return new SegmentOutput(buffer, table.extractRawAndFree());
+        return table.extractRawAndFree();
     }
 
     /**
@@ -436,7 +435,7 @@ public class CalculateAverage_M1PRO {
      * any real signal about whether a wider width helps on M1 Pro's core. This
      * isolates the width variable from that array-indexing/JIT-scheduling overhead.
      */
-    private static SegmentOutput processSegmentInterleaved4(long base, int limit, OffHeapTable table, MappedByteBuffer buffer) {
+    private static List<RawEntry> processSegmentInterleaved4(long base, int limit, OffHeapTable table) {
         int dist = limit / 4;
         int mid1 = nextNewLineBounded(base, dist, limit);
         int mid2 = nextNewLineBounded(base, dist * 2, limit);
@@ -470,7 +469,7 @@ public class CalculateAverage_M1PRO {
             pos4 = processRow(base, limit, pos4, table);
         }
 
-        return new SegmentOutput(buffer, table.extractRawAndFree());
+        return table.extractRawAndFree();
     }
 
     /**
@@ -480,7 +479,7 @@ public class CalculateAverage_M1PRO {
      * same principle as the hand-unrolled 3-way version above, just array-indexed
      * to support a runtime-chosen width instead of 3 named locals.
      */
-    private static SegmentOutput processSegmentInterleavedN(long base, int limit, OffHeapTable table, MappedByteBuffer buffer) {
+    private static List<RawEntry> processSegmentInterleavedN(long base, int limit, OffHeapTable table) {
         int n = INTERLEAVE_WIDTH;
         int[] pos = new int[n];
         int[] segEnd = new int[n];
@@ -502,7 +501,7 @@ public class CalculateAverage_M1PRO {
                             pos[t] = processRow(base, limit, pos[t], table);
                         }
                     }
-                    return new SegmentOutput(buffer, table.extractRawAndFree());
+                    return table.extractRawAndFree();
                 }
             }
             for (int k = 0; k < n; k++) {
@@ -519,10 +518,12 @@ public class CalculateAverage_M1PRO {
     /**
      * Parses one "name;value\n" row starting at {@code i} into {@code table}
      * and returns the position just past it. {@code limit} is always the
-     * segment's own true end (not the calling cursor's sub-range end) -
-     * each segment is its own separate MappedByteBuffer here (unlike
-     * CalculateAverage_thomaswue's single whole-file mapping), so this is
-     * the only bound that must never be read past.
+     * segment's own true end (not the calling cursor's sub-range end) - as of
+     * v14 all segments share one whole-file mapping (see main()), so this
+     * bound is no longer about avoiding an out-of-bounds read past a
+     * segment-local mapping; it's still required for correctness of work
+     * partitioning, so a cursor never scans into a neighboring segment's rows
+     * (which another thread's OffHeapTable owns).
      *
      * v8: reads the first 16 bytes unconditionally and locates the ';' via a
      * single trailing-zero-count on a combined delimiter mask, instead of
@@ -674,11 +675,11 @@ public class CalculateAverage_M1PRO {
 
     /**
      * Finds the next '\n' at or after {@code pos}, never reading past
-     * {@code limit} - unlike CalculateAverage_thomaswue's unbounded
-     * nextNewLine (safe there only because it maps the whole file at once),
-     * each segment here is its own separate mapping, so overrunning it is a
-     * real out-of-bounds read, not just a read into a later part of the
-     * same file.
+     * {@code limit}. Unlike CalculateAverage_thomaswue's unbounded
+     * nextNewLine, this stays bounded even though (as of v14) both now share
+     * one whole-file mapping - the bound here is about not scanning into a
+     * neighboring segment's rows (a work-partitioning correctness concern),
+     * not about mapping safety.
      */
     private static int nextNewLineBounded(long base, int pos, int limit) {
         while (pos + 8 <= limit) {
@@ -715,22 +716,12 @@ public class CalculateAverage_M1PRO {
         return true;
     }
 
-    /** What a worker thread hands back: the entries it found, plus the mapping they point into. */
-    private static final class SegmentOutput {
-        final MappedByteBuffer buffer;
-        final List<RawEntry> entries;
-
-        SegmentOutput(MappedByteBuffer buffer, List<RawEntry> entries) {
-            this.buffer = buffer;
-            this.entries = entries;
-        }
-    }
-
     /**
      * One occupied slot's data, extracted from a segment's off-heap table
      * with no String decoding - just the raw (address,len) the name lives
-     * at plus its aggregates. base+offset only stays valid as long as the
-     * originating MappedByteBuffer is kept reachable (see keepAlive in main).
+     * at plus its aggregates. base+offset points into the one whole-file
+     * mapping (see main()'s v14 note), kept alive for the JVM's lifetime by
+     * Arena.global() - no per-segment reachability tracking needed.
      */
     private static final class RawEntry {
         final long base;
@@ -861,8 +852,8 @@ public class CalculateAverage_M1PRO {
          * Extracts every occupied slot as a String-free RawEntry and frees
          * this table's off-heap memory. Does NOT touch the mapped file's
          * memory - that's still referenced (by raw address) from the
-         * returned entries, and stays valid only as long as the caller keeps
-         * the originating MappedByteBuffer reachable.
+         * returned entries, and stays valid for the JVM's lifetime via
+         * Arena.global() (see main()'s v14 note).
          */
         List<RawEntry> extractRawAndFree() {
             List<RawEntry> list = new ArrayList<>(size);

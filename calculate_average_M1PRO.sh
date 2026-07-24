@@ -15,5 +15,5 @@
 #  limitations under the License.
 #
 
-JAVA_OPTS="--add-opens java.base/java.nio=ALL-UNNAMED"
+JAVA_OPTS="--enable-preview"
 java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_M1PRO
