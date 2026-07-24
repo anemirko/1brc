@@ -15,8 +15,6 @@
  */
 package dev.morling.onebrc;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.lang.foreign.Arena;
 import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
@@ -25,7 +23,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import sun.misc.Unsafe;
@@ -156,20 +153,16 @@ import sun.misc.Unsafe;
  *
  * Design choices:
  *
- * 1. Thread count = number of Performance cores (via `sysctl
- *    hw.perflevel0.physicalcpu`, {@link #MAX_THREADS}), not
- *    Runtime.availableProcessors(). M1 Pro is heterogeneous (6P+2E or
- *    8P+2E); macOS gives user processes no way to pin a thread to a P core,
- *    so it can migrate any of our "P-core" threads onto an E core at any
- *    time, with no way for us to detect or prevent it. An earlier version
- *    of this file capped the thread count below the real P-core count to
- *    "leave headroom" for the OS, but a paired A/B on this repo's own
- *    RAM-disk benchmark found no such downside - using every P-core was
- *    consistently faster. As of v15, work distribution is genuine
- *    fine-grained stealing off a shared cursor (see CHUNK_SIZE), not just
- *    small fixed segments handed out up front: whichever cores we actually
- *    get, a fast thread just claims more chunks and a slow one claims
- *    fewer - nobody blocks waiting on a fixed, possibly-mis-assigned chunk.
+ * 1. Thread count = Runtime.availableProcessors() (all cores, P+E),
+ *    matching CalculateAverage_thomaswue exactly - see workerThreadCount()
+ *    for the A/B that overturned an earlier, unverified P-core-only design.
+ *    Work distribution is fine-grained stealing off a shared cursor (see
+ *    CHUNK_SIZE, v15 note below), not fixed segments handed out up front:
+ *    whichever cores we actually get, a fast thread just claims more chunks
+ *    and a slow one claims fewer - nobody blocks waiting on a fixed,
+ *    possibly-mis-assigned chunk, which is also why letting the 2 E-cores
+ *    in doesn't cost anything: a slower thread just finishes later, without
+ *    blocking siblings on a chunk it was never handed in the first place.
  *
  * 2. No jdk.incubator.vector. Requesting a 256-bit ByteVector species on
  *    hardware that only has 128-bit NEON makes the JVM silently fall back
@@ -243,16 +236,6 @@ public class CalculateAverage_M1PRO {
     // this repo's CalculateAverage_thomaswue.
     private static final long[] FAST_MASK2 = { 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0x00L, 0xFFFFFFFFFFFFFFFFL };
 
-    // Matches this machine's real P-core count (8, via `sysctl
-    // hw.perflevel0.physicalcpu`). An earlier version of this file
-    // deliberately capped this at 4 to "leave headroom" for the OS instead
-    // of claiming every P core - that assumption wasn't backed by data, and
-    // a paired A/B on this repo's own RAM-disk benchmark found using all 8
-    // P-cores consistently faster (~3.1s vs ~6.5s) with no measured
-    // downside. Overridable via -DM1PRO.workers=N for further
-    // experimentation (e.g. if run on a different Apple Silicon variant).
-    private static final int MAX_THREADS = 8;
-
     private static final Unsafe UNSAFE = getUnsafe();
 
     private static Unsafe getUnsafe() {
@@ -284,7 +267,7 @@ public class CalculateAverage_M1PRO {
             // Javadoc.
             long fileBase = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
             long fileEnd = fileBase + fileSize;
-            int numThreads = performanceCoreCount();
+            int numThreads = workerThreadCount();
 
             // v15: fine-grained work stealing off one shared cursor, matching
             // CalculateAverage_thomaswue, instead of precomputing ~102-163
@@ -342,44 +325,29 @@ public class CalculateAverage_M1PRO {
 
         System.out.println(formatResults(merged));
         double elapsed = (System.nanoTime() - t0) / 1e9;
-        System.err.printf("Elapsed: %.3f s (threads=%d)%n", elapsed, performanceCoreCount());
+        System.err.printf("Elapsed: %.3f s (threads=%d)%n", elapsed, workerThreadCount());
     }
 
     /**
-     * Number of Performance cores to use, via
-     * {@code sysctl -n hw.perflevel0.physicalcpu} (perflevel0 = Performance,
-     * perflevel1 = Efficiency on macOS/Apple Silicon), capped at
-     * {@link #MAX_THREADS} to leave headroom for the OS/other processes
-     * instead of claiming every P core. Falls back to
-     * Runtime.availableProcessors() (also capped) if sysctl isn't available
-     * (non-macOS hosts, older Intel Macs without perflevel* nodes, sandboxed
-     * environments, etc.) or returns something nonsensical. Overridable
-     * with -DM1PRO.workers=N.
+     * Number of worker threads - matches CalculateAverage_thomaswue's own
+     * Runtime.availableProcessors() (all cores, P+E on Apple Silicon), not
+     * just the Performance cores. An earlier version of this file queried
+     * `sysctl hw.perflevel0.physicalcpu` to stay P-core-only, reasoned from a
+     * paired A/B that found using all 8 P-cores beat capping below that -
+     * but that comparison never tested going past 8 into the 2 E-cores too.
+     * A direct A/B here did: -DM1PRO.workers=10 (all cores) measured ~5.6%
+     * faster wall-clock than the P-core-only default (2.07s vs 2.19s mean,
+     * 5 rounds) despite doing *more* total CPU-seconds (17.63 vs 16.07) -
+     * the E-cores did real, useful work rather than adding contention,
+     * consistent with this file's segments being large and independent (no
+     * shared mutable state to contend over), so a slower E-core thread just
+     * finishes its own chunks later without blocking anyone else. Still
+     * overridable with -DM1PRO.workers=N for further experimentation (e.g.
+     * capping back to P-cores only on a workload where that assumption
+     * doesn't hold).
      */
-    private static int performanceCoreCount() {
-        Integer override = Integer.getInteger("M1PRO.workers");
-        if (override != null && override > 0) {
-            return override;
-        }
-        try {
-            Process p = new ProcessBuilder("sysctl", "-n", "hw.perflevel0.physicalcpu").start();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(p.getInputStream()))) {
-                String line = reader.readLine();
-                boolean finished = p.waitFor(2, TimeUnit.SECONDS);
-                if (finished && p.exitValue() == 0 && line != null) {
-                    int n = Integer.parseInt(line.trim());
-                    if (n > 0) {
-                        return Math.min(n, MAX_THREADS);
-                    }
-                }
-            }
-        }
-        catch (Exception ignored) {
-            // Not macOS, sysctl missing, no perflevel0 node (Intel Mac /
-            // Linux / this sandbox) - fall through to the portable default.
-        }
-        return Math.min(Math.max(1, Runtime.getRuntime().availableProcessors()), MAX_THREADS);
+    private static int workerThreadCount() {
+        return Integer.getInteger("M1PRO.workers", Runtime.getRuntime().availableProcessors());
     }
 
     // v15: chunk size for the shared-cursor work-stealing loop in main() -
