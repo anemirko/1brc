@@ -31,6 +31,56 @@ import sun.misc.Unsafe;
  * 1BRC solution tuned for Apple Silicon (M1 Pro) instead of the reference
  * EPYC 7502P (Zen2) evaluation box used by the official leaderboard.
  *
+ * v16: gives each worker thread one persistent OffHeapTable for its entire
+ * run, reused across every chunk it claims off the v15 AtomicLong cursor,
+ * instead of a fresh table per chunk. Tried as a targeted test of a specific
+ * hypothesis, not a guess: after v15 fixed effective parallelism (M1PRO
+ * matched/exceeded thomaswue's CPU-seconds/wall-time ratio), the remaining
+ * gap was ~48% more total CPU-seconds for the same job, and a table-lifecycle
+ * profiling pass (nanoTime bracketing around OffHeapTable construction,
+ * extractRawAndFree(), and GlobalTable.merge(), summed across all ~400
+ * per-chunk tables at the 32MB default) found that combined overhead was
+ * 0.25-0.42% of total CPU-seconds - conclusively ruling out construction/
+ * extraction/merge cost as the cause. This change targets a different,
+ * related hypothesis the profiling pass couldn't see: cache-miss cost from
+ * every chunk hitting a cold, freshly-zeroed table, invisible to a
+ * phase-based measurement because it's baked into the already-large
+ * row-processing bucket, not a separate line item - matching thomaswue's own
+ * per-thread Result[] reuse instead of allocating fresh per unit of work.
+ *
+ * Widened OffHeapTable's per-slot keyOffset from a 4-byte int (relative to
+ * one chunk's own base) to an 8-byte absolute keyAddr, since a persistent
+ * table now holds entries from many different chunks scattered across the
+ * whole 13GB file with no single base they're all relative to any more (see
+ * slot layout below) - fit inside the existing padding, so slots stay 64
+ * bytes/one cache line. RawEntry and GlobalTable simplified the same way
+ * (a single absolute address instead of a base+offset pair) as a direct,
+ * required consequence, not scope creep.
+ *
+ * Result: a wash. 5-round A/B, same file, back-to-back: 2.032s/17.72
+ * CPU-s/8.72x effective parallelism (v15) vs 2.032s/17.59 CPU-s/8.66x (v16) -
+ * identical wall-clock, a ~0.7% CPU-seconds difference well inside this
+ * session's noise floor. A follow-up attempt to isolate OffHeapTable.update()
+ * specifically (same nanoTime-bracketing technique that worked cleanly for
+ * the table-lifecycle profiling above) hit a genuine measurement wall rather
+ * than a clean answer either way: timing every call (~13M+ times) caused
+ * System.nanoTime() itself to become ~45x more expensive per call under
+ * sustained 10-thread concurrent contention on this machine (measured
+ * directly: ~12.6ns single-threaded vs ~573ns under 10-way concurrency),
+ * which alone made the instrumented run 10x+ slower - not a logic bug (small
+ * inputs ran instantly and correctly; jstack confirmed all 10 threads
+ * genuinely RUNNABLE inside update(), not deadlocked). Sampling 1-in-997
+ * calls avoided the hang but still produced a result contaminated by the
+ * same contention (an extrapolated update()-only total that exceeded the
+ * entire program's measured CPU budget for that run - not just noisy, but
+ * arithmetically impossible), so no isolated per-method number is reported
+ * either way. Combined with the wash on the real, uninstrumented wall-clock/
+ * CPU-seconds numbers above, this closes off both table-related hypotheses
+ * (construction overhead, ruled out by the earlier profiling; cache warmth,
+ * a wash here) without a confirmed mechanism either way for the remaining
+ * gap - kept anyway since a persistent table is the more direct structural
+ * match to thomaswue and isn't a regression.
+ *
  * v15: replaces the precomputed ~102-163 fixed 128MB segments (each handed
  * to an ExecutorService as one Future) with fine-grained work stealing off
  * one shared AtomicLong cursor and a plain Thread[] - matching
@@ -212,11 +262,15 @@ public class CalculateAverage_M1PRO {
     // 8: int count
     // 12: short min (fixed-point)
     // 14: short max (fixed-point)
-    // 16: int keyOffset (relative to this segment's mapped base address)
-    // 20: short keyLen (0 == empty slot sentinel; no station name is empty)
-    // 22: short pad
-    // 24: int hash (precomputed, avoids re-hashing bytes on resize)
-    // 28: int pad2
+    // 16: long keyAddr (v16: absolute address of the name's first byte -
+    // base+nameOffset, computed once by the caller - widened from a
+    // 4-byte offset relative to a single chunk's own base, because a
+    // persistent per-thread table (see class Javadoc) now holds entries
+    // from many different chunks scattered across the whole 13GB file,
+    // with no single base they're all relative to any more)
+    // 24: short keyLen (0 == empty slot sentinel; no station name is empty)
+    // 26: short pad
+    // 28: int hash (precomputed, avoids re-hashing bytes on resize)
     // 32: long firstNameWord (v5: first 8 bytes of the name, zero-padded if shorter)
     // 40: long secondNameWord (v5: next 8 bytes, zero-padded if the name is <=16 bytes)
     // 48: 16 bytes pad, rounds the slot out to one cache line
@@ -281,7 +335,15 @@ public class CalculateAverage_M1PRO {
             for (int t = 0; t < numThreads; t++) {
                 final int index = t;
                 threads[t] = new Thread(() -> {
-                    List<RawEntry> collected = new ArrayList<>();
+                    // v16: one persistent OffHeapTable per thread, reused
+                    // across every chunk it claims, instead of a fresh table
+                    // per chunk - see class Javadoc for why (a table-lifecycle
+                    // profiling pass ruled out construction/extraction/merge
+                    // overhead as the cause of the CPU-seconds gap to
+                    // thomaswue; this tests cache-locality from a warm,
+                    // reused table instead, matching thomaswue's own
+                    // per-thread Result[] reuse).
+                    OffHeapTable table = new OffHeapTable();
                     while (true) {
                         long current = cursor.addAndGet(CHUNK_SIZE) - CHUNK_SIZE;
                         if (current >= fileEnd) {
@@ -297,13 +359,13 @@ public class CalculateAverage_M1PRO {
                             continue;
                         }
                         try {
-                            collected.addAll(processSegment(fileBase, chunkStart - fileBase, chunkEnd - fileBase));
+                            processSegment(fileBase, chunkStart - fileBase, chunkEnd - fileBase, table);
                         }
                         catch (Exception e) {
                             throw new RuntimeException(e);
                         }
                     }
-                    threadResults[index] = collected;
+                    threadResults[index] = table.extractRawAndFree();
                 });
                 threads[t].start();
             }
@@ -400,11 +462,9 @@ public class CalculateAverage_M1PRO {
     // path, which is *not* a clean comparison against either hand-unrolled path.
     private static final int INTERLEAVE_WIDTH = Integer.getInteger("M1PRO.interleaveWidth", 4);
 
-    private static List<RawEntry> processSegment(long fileBase, long start, long end) throws Exception {
+    private static void processSegment(long fileBase, long start, long end, OffHeapTable table) throws Exception {
         long base = fileBase + start;
         int limit = (int) (end - start);
-
-        OffHeapTable table = new OffHeapTable(base);
 
         if (!INTERLEAVE) {
             // Plain single-cursor sweep, no interleaving. Kept as an A/B
@@ -422,15 +482,17 @@ public class CalculateAverage_M1PRO {
             while (i < limit) {
                 i = processRow(base, limit, i, table);
             }
-            return table.extractRawAndFree();
+            return;
         }
 
         if (INTERLEAVE_WIDTH == 4) {
-            return processSegmentInterleaved4(base, limit, table);
+            processSegmentInterleaved4(base, limit, table);
+            return;
         }
 
         if (INTERLEAVE_WIDTH != 3) {
-            return processSegmentInterleavedN(base, limit, table);
+            processSegmentInterleavedN(base, limit, table);
+            return;
         }
 
         // v4: split the segment into three roughly equal, row-aligned parts
@@ -468,8 +530,6 @@ public class CalculateAverage_M1PRO {
         while (pos3 < end3) {
             pos3 = processRow(base, limit, pos3, table);
         }
-
-        return table.extractRawAndFree();
     }
 
     /**
@@ -480,7 +540,7 @@ public class CalculateAverage_M1PRO {
      * any real signal about whether a wider width helps on M1 Pro's core. This
      * isolates the width variable from that array-indexing/JIT-scheduling overhead.
      */
-    private static List<RawEntry> processSegmentInterleaved4(long base, int limit, OffHeapTable table) {
+    private static void processSegmentInterleaved4(long base, int limit, OffHeapTable table) {
         int dist = limit / 4;
         int mid1 = nextNewLineBounded(base, dist, limit);
         int mid2 = nextNewLineBounded(base, dist * 2, limit);
@@ -513,8 +573,6 @@ public class CalculateAverage_M1PRO {
         while (pos4 < end4) {
             pos4 = processRow(base, limit, pos4, table);
         }
-
-        return table.extractRawAndFree();
     }
 
     /**
@@ -524,7 +582,7 @@ public class CalculateAverage_M1PRO {
      * same principle as the hand-unrolled 3-way version above, just array-indexed
      * to support a runtime-chosen width instead of 3 named locals.
      */
-    private static List<RawEntry> processSegmentInterleavedN(long base, int limit, OffHeapTable table) {
+    private static void processSegmentInterleavedN(long base, int limit, OffHeapTable table) {
         int n = INTERLEAVE_WIDTH;
         int[] pos = new int[n];
         int[] segEnd = new int[n];
@@ -546,7 +604,7 @@ public class CalculateAverage_M1PRO {
                             pos[t] = processRow(base, limit, pos[t], table);
                         }
                     }
-                    return table.extractRawAndFree();
+                    return;
                 }
             }
             for (int k = 0; k < n; k++) {
@@ -699,7 +757,7 @@ public class CalculateAverage_M1PRO {
                 value = -value;
         }
 
-        table.update(nameStart, nameLen, hash, firstWord, secondWord, value);
+        table.update(base + nameStart, nameLen, hash, firstWord, secondWord, value);
         return i;
     }
 
@@ -762,24 +820,24 @@ public class CalculateAverage_M1PRO {
     }
 
     /**
-     * One occupied slot's data, extracted from a segment's off-heap table
+     * One occupied slot's data, extracted from a thread's off-heap table
      * with no String decoding - just the raw (address,len) the name lives
-     * at plus its aggregates. base+offset points into the one whole-file
-     * mapping (see main()'s v14 note), kept alive for the JVM's lifetime by
+     * at plus its aggregates. addr is an absolute address into the one
+     * whole-file mapping (see main()'s v14 note; v16 widened this from a
+     * separate base+offset pair once OffHeapTable itself went absolute -
+     * see its own Javadoc), kept alive for the JVM's lifetime by
      * Arena.global() - no per-segment reachability tracking needed.
      */
     private static final class RawEntry {
-        final long base;
-        final int offset;
+        final long addr;
         final int len;
         final int hash;
         final long sum;
         final int count;
         final short min, max;
 
-        RawEntry(long base, int offset, int len, int hash, long sum, int count, short min, short max) {
-            this.base = base;
-            this.offset = offset;
+        RawEntry(long addr, int len, int hash, long sum, int count, short min, short max) {
+            this.addr = addr;
             this.len = len;
             this.hash = hash;
             this.sum = sum;
@@ -790,21 +848,25 @@ public class CalculateAverage_M1PRO {
     }
 
     /**
-     * Off-heap, fixed-stride open-addressing hash table. One instance per
-     * worker thread/segment; keys are zero-copy (offset,len) references
-     * into that segment's own mapped memory, so equality checks compare
-     * raw bytes straight out of the mapped file with no intermediate
-     * allocation.
+     * Off-heap, fixed-stride open-addressing hash table. One persistent
+     * instance per worker thread (v16; see class Javadoc), reused across
+     * every chunk that thread claims over its whole run; keys are zero-copy
+     * absolute-address references into the one whole-file mapping, so
+     * equality checks compare raw bytes straight out of the mapped file
+     * with no intermediate allocation.
      */
     private static final class OffHeapTable {
-        private final long segmentBase;
         private int capacity = 1 << 14; // 16384 slots * 32B = 512KB
         private int mask = capacity - 1;
         private long table = UNSAFE.allocateMemory((long) capacity * SLOT_SIZE);
         private int size = 0;
 
-        OffHeapTable(long segmentBase) {
-            this.segmentBase = segmentBase;
+        // v16: no more per-table segmentBase - see class Javadoc. One table
+        // is now created per worker thread (not per chunk) and reused across
+        // every chunk that thread claims off the AtomicLong cursor over its
+        // whole run, so there's no single chunk base it could meaningfully
+        // hold any more; update() takes an absolute nameAddr instead.
+        OffHeapTable() {
             UNSAFE.setMemory(table, (long) capacity * SLOT_SIZE, (byte) 0);
         }
 
@@ -824,7 +886,7 @@ public class CalculateAverage_M1PRO {
         // need regionEquals() to confirm full equality beyond that
         // first-16-byte prefix - credit: this repo's CalculateAverage_thomaswue,
         // which uses the identical (0,0)-as-empty / packed-word-first structure.
-        void update(int nameOffset, int nameLen, int hash, long firstWord, long secondWord, int value) {
+        void update(long nameAddr, int nameLen, int hash, long firstWord, long secondWord, int value) {
             boolean needsFullCompare = nameLen > 16;
 
             int idx = hash & mask;
@@ -838,9 +900,9 @@ public class CalculateAverage_M1PRO {
                     UNSAFE.putInt(addr + 8, 1);
                     UNSAFE.putShort(addr + 12, (short) value);
                     UNSAFE.putShort(addr + 14, (short) value);
-                    UNSAFE.putInt(addr + 16, nameOffset);
-                    UNSAFE.putShort(addr + 20, (short) nameLen);
-                    UNSAFE.putInt(addr + 24, hash);
+                    UNSAFE.putLong(addr + 16, nameAddr);
+                    UNSAFE.putShort(addr + 24, (short) nameLen);
+                    UNSAFE.putInt(addr + 28, hash);
                     UNSAFE.putLong(addr + 32, firstWord);
                     UNSAFE.putLong(addr + 40, secondWord);
                     size++;
@@ -850,7 +912,7 @@ public class CalculateAverage_M1PRO {
                 }
 
                 if (storedFirst == firstWord && storedSecond == secondWord
-                        && (!needsFullCompare || regionEquals(segmentBase + UNSAFE.getInt(addr + 16), segmentBase + nameOffset, nameLen))) {
+                        && (!needsFullCompare || regionEquals(UNSAFE.getLong(addr + 16), nameAddr, nameLen))) {
                     UNSAFE.putLong(addr, UNSAFE.getLong(addr) + value);
                     UNSAFE.putInt(addr + 8, UNSAFE.getInt(addr + 8) + 1);
                     short min = UNSAFE.getShort(addr + 12);
@@ -873,13 +935,13 @@ public class CalculateAverage_M1PRO {
 
             for (int i = 0; i < capacity; i++) {
                 long addr = slotAddr(table, i);
-                short len = UNSAFE.getShort(addr + 20);
+                short len = UNSAFE.getShort(addr + 24);
                 if (len != 0) {
-                    int hash = UNSAFE.getInt(addr + 24);
+                    int hash = UNSAFE.getInt(addr + 28);
                     int idx = hash & newMask;
                     while (true) {
                         long newAddr = slotAddr(newTable, idx);
-                        if (UNSAFE.getShort(newAddr + 20) == 0) {
+                        if (UNSAFE.getShort(newAddr + 24) == 0) {
                             UNSAFE.copyMemory(addr, newAddr, SLOT_SIZE);
                             break;
                         }
@@ -896,23 +958,25 @@ public class CalculateAverage_M1PRO {
         /**
          * Extracts every occupied slot as a String-free RawEntry and frees
          * this table's off-heap memory. Does NOT touch the mapped file's
-         * memory - that's still referenced (by raw address) from the
+         * memory - that's still referenced (by absolute address) from the
          * returned entries, and stays valid for the JVM's lifetime via
-         * Arena.global() (see main()'s v14 note).
+         * Arena.global() (see main()'s v14 note). As of v16, called once per
+         * worker thread when its cursor claims are exhausted, not once per
+         * chunk - see class Javadoc.
          */
         List<RawEntry> extractRawAndFree() {
             List<RawEntry> list = new ArrayList<>(size);
             for (int i = 0; i < capacity; i++) {
                 long addr = slotAddr(table, i);
-                short len = UNSAFE.getShort(addr + 20);
+                short len = UNSAFE.getShort(addr + 24);
                 if (len != 0) {
-                    int offset = UNSAFE.getInt(addr + 16);
-                    int hash = UNSAFE.getInt(addr + 24);
+                    long nameAddr = UNSAFE.getLong(addr + 16);
+                    int hash = UNSAFE.getInt(addr + 28);
                     long sum = UNSAFE.getLong(addr);
                     int count = UNSAFE.getInt(addr + 8);
                     short min = UNSAFE.getShort(addr + 12);
                     short max = UNSAFE.getShort(addr + 14);
-                    list.add(new RawEntry(segmentBase, offset, len, hash, sum, count, min, max));
+                    list.add(new RawEntry(nameAddr, len, hash, sum, count, min, max));
                 }
             }
             UNSAFE.freeMemory(table);
@@ -931,8 +995,7 @@ public class CalculateAverage_M1PRO {
     private static final class GlobalTable {
         private int capacity = 1024;
         private int mask = capacity - 1;
-        private long[] keyBase = new long[capacity];
-        private int[] keyOffset = new int[capacity];
+        private long[] keyAddr = new long[capacity];
         private int[] keyLen = new int[capacity]; // 0 == empty slot sentinel
         private int[] hashes = new int[capacity];
         private long[] sums = new long[capacity];
@@ -946,8 +1009,7 @@ public class CalculateAverage_M1PRO {
             while (true) {
                 int len = keyLen[idx];
                 if (len == 0) {
-                    keyBase[idx] = e.base;
-                    keyOffset[idx] = e.offset;
+                    keyAddr[idx] = e.addr;
                     keyLen[idx] = e.len;
                     hashes[idx] = e.hash;
                     sums[idx] = e.sum;
@@ -959,7 +1021,7 @@ public class CalculateAverage_M1PRO {
                         resize();
                     return;
                 }
-                if (len == e.len && regionEquals(keyBase[idx] + keyOffset[idx], e.base + e.offset, e.len)) {
+                if (len == e.len && regionEquals(keyAddr[idx], e.addr, e.len)) {
                     sums[idx] += e.sum;
                     counts[idx] += e.count;
                     if (e.min < mins[idx])
@@ -974,8 +1036,7 @@ public class CalculateAverage_M1PRO {
 
         private void resize() {
             int newCapacity = capacity * 2;
-            long[] nKeyBase = new long[newCapacity];
-            int[] nKeyOffset = new int[newCapacity];
+            long[] nKeyAddr = new long[newCapacity];
             int[] nKeyLen = new int[newCapacity];
             int[] nHashes = new int[newCapacity];
             long[] nSums = new long[newCapacity];
@@ -990,8 +1051,7 @@ public class CalculateAverage_M1PRO {
                     while (nKeyLen[idx] != 0) {
                         idx = (idx + 1) & newMask;
                     }
-                    nKeyBase[idx] = keyBase[i];
-                    nKeyOffset[idx] = keyOffset[i];
+                    nKeyAddr[idx] = keyAddr[i];
                     nKeyLen[idx] = keyLen[i];
                     nHashes[idx] = hashes[i];
                     nSums[idx] = sums[i];
@@ -1000,8 +1060,7 @@ public class CalculateAverage_M1PRO {
                     nMaxs[idx] = maxs[i];
                 }
             }
-            keyBase = nKeyBase;
-            keyOffset = nKeyOffset;
+            keyAddr = nKeyAddr;
             keyLen = nKeyLen;
             hashes = nHashes;
             sums = nSums;
@@ -1018,7 +1077,7 @@ public class CalculateAverage_M1PRO {
             for (int i = 0; i < capacity; i++) {
                 int len = keyLen[i];
                 if (len != 0) {
-                    long addr = keyBase[i] + keyOffset[i];
+                    long addr = keyAddr[i];
                     byte[] nameBytes = new byte[len];
                     for (int k = 0; k < len; k++) {
                         nameBytes[k] = UNSAFE.getByte(addr + k);
